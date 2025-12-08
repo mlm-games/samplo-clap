@@ -1,38 +1,106 @@
-# Vitsel
+# Samplo
 
-A small Rust CLAP synth that runs headless on Android (for yadaw) and on desktop CLAP hosts.
+A minimal Rust CLAP sampler with SFZ support, running headless on Android (yadaw) and desktop hosts.
 
-Highlights
-- PolyBLEP oscillators: sine, saw, square; triangle via integrated BL square
-- ADSR, zero-delay TPT SVF (LP/BP/HP)
-- Polyphonic modulation for Gain and Cutoff (CLAP), sample-accurate events, VoiceTerminated
-- No allocations or locks in the audio thread, denormal guards, soft-clipper safety
-- 32–64 voices with simple oldest-voice stealing
-- Headless: hosts build a parameter UI (Android-friendly)
+## Features
 
-Build (Android on-device via Termux)
-```sh
-pkg update && pkg install -y rust clang cmake ninja pkg-config git
-cargo install cargo-ndk
-rustup target add aarch64-linux-android
-export CARGO_NDK_ON_ANDROID=1
-cargo ndk -t arm64-v8a --platform 26 build --release
-cp target/aarch64-linux-android/release/libvitsel.so Vitsel.clap
+- **Audio formats**: WAV, FLAC (via Symphonia)
+- **Instrument formats**: JSON, SFZ
+- **Multi-sample mapping**: Note and velocity layers
+- **Round robin**: Automatic sample cycling for realistic playback
+- **Interpolation**: 4-point Hermite for quality pitch shifting
+- **Loops**: Sustain loop support
+- **ADSR envelope**: Per-voice amplitude shaping
+- **Filter**: Zero-delay SVF (LP/HP/BP)
+- **Polyphony**: Up to 64 voices with oldest-voice stealing
+- **Headless**: No GUI required
+
+## SFZ Support
+
+Supported opcodes:
+
+| Category | Opcodes |
+|----------|---------|
+| Sample | `sample`, `offset`, `end` |
+| Mapping | `key`, `lokey`, `hikey`, `pitch_keycenter` |
+| Velocity | `lovel`, `hivel` |
+| Loop | `loop_mode`, `loop_start`, `loop_end` |
+| Tuning | `tune`, `volume`, `pan` |
+| Round Robin | `seq_length`, `seq_position`, `group` |
+| Control | `default_path` |
+
+### Example SFZ
+
+```sfz
+<control>
+default_path=samples/
+
+<global>
+loop_mode=no_loop
+
+<group>
+lokey=60 hikey=60
+
+<region>
+sample=piano_c4_rr1.wav
+seq_position=1
+seq_length=3
+
+<region>
+sample=piano_c4_rr2.wav
+seq_position=2
+seq_length=3
+
+<region>
+sample=piano_c4_rr3.wav
+seq_position=3
+seq_length=3
 ```
 
-Use with yadaw (Android)
-- Put Vitsel.clap in a directory yadaw scans, e.g.:
-  - /storage/emulated/0/Android/data/<your.yadaw.package>/files/plugins/clap/ (need adb or shizuku access, yadaw supports it by copying it from external to internal, since newer android devices open everything under storage/emulated/0 in noexec mode)
-  - Create a folder that ends with .clap and put the .so file in the folder (compiled file from the binary, rename the .clap file to .so if you ran the cp step given above)
-  - or your app-internal: /data/data/<your.yadaw.package>/files/plugins/clap/ (need root perms, similar naming scheme as above)
-<!-- - In yadaw, set additional plugin search paths if you added UI to configure them. -->
+### Example Json
 
-Build (desktop quick)
-- Linux: `cargo build --release && cp target/release/libvitsel.so Vitsel.clap`
-- Windows (MSVC): `cargo build --release && copy target\release\vitsel.dll Vitsel.clap`
-- macOS: `cargo build --release` then bundle as a .clap, or use NIH‑plug’s bundler (`cargo xtask bundle` if you set it up)
+```json
+{
+  "name": "Ukulele",
+  "regions": [
+    {
+      "sample": "uke_c4_v1.wav",
+      "root": 60,
+      "lo_note": 48,
+      "hi_note": 71,
+      "lo_vel": 0,
+      "hi_vel": 80,
+      "rr_group": 1,
+      "rr_seq": 0
+    },
+    {
+      "sample": "uke_c4_v2.wav",
+      "root": 60,
+      "lo_note": 48,
+      "hi_note": 71,
+      "lo_vel": 0,
+      "hi_vel": 80,
+      "rr_group": 1,
+      "rr_seq": 1
+    }
+  ]
+}
+```
 
-Notes on CLAP poly‑mod
-- using normalized_offset and Param::preview_modulated() for per‑voice values and emits NoteEvent::VoiceTerminated when voices end; his plugin also sets capacity on init/resize. For more info, see NoteEvent::PolyModulation, Param, and ClapPlugin::PolyModulationConfig in NIH‑plug docs.
+### Build 
+
+```sh
+# Linux
+cargo build --release
+cp target/release/libsamplo.so Samplo.clap
+
+# Windows
+cargo build --release
+copy target\release\samplo.dll Samplo.clap
+
+# Android (Termux)
+cargo ndk -t arm64-v8a --platform 26 build --release
+cp target/aarch64-linux-android/release/libsamplo.so Samplo.clap
+```
 
 [License](LICENSE)

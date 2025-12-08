@@ -34,9 +34,9 @@ jobs:
           
           DOWNLOADED=false
           for TAG in "$VERSION" "v$VERSION"; do
-            URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Vitsel-linux.clap"
+            URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Samplo-linux.clap"
             if curl --output /dev/null --silent --head --fail "$URL"; then
-              wget -O "downloads/Vitsel-linux.clap" "$URL"
+              wget -O "downloads/Samplo-linux.clap" "$URL"
               DOWNLOADED=true
               break
             fi
@@ -52,7 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          HASH=$(sha256sum "downloads/Vitsel-linux.clap" | cut -d ' ' -f 1)
+          HASH=$(sha256sum "downloads/Samplo-linux.clap" | cut -d ' ' -f 1)
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
 
       - name: Get current AUR package info and determine pkgrel
@@ -63,7 +63,7 @@ jobs:
           
           NEW_VERSION="${{ steps.version.outputs.version }}"
           
-          PKGBUILD=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=vitsel-clap-bin" 2>/dev/null || echo "")
+          PKGBUILD=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=samplo-clap-bin" 2>/dev/null || echo "")
           
           if [[ -n "$PKGBUILD" ]]; then
             CURRENT_VER=$(echo "$PKGBUILD" | grep "^pkgver=" | head -1 | cut -d= -f2 | tr -d "'" | tr -d '"' | tr -d ' ')
@@ -97,26 +97,26 @@ jobs:
           mkdir -p aur-package
           cat > aur-package/PKGBUILD << 'EOF'
           # Maintainer: MLM-stuff <gfxoxinzh@mozmail.com>
-          pkgname=vitsel-clap-bin
-          _pkgname=vitsel
+          pkgname=samplo-clap-bin
+          _pkgname=samplo
           pkgver={{VER}}
           pkgrel={{PKGREL}}
           pkgdesc="Minimal Rust CLAP synth with PolyBLEP oscillators, ADSR, and zero-delay TPT SVF"
           arch=('x86_64')
-          url="https://github.com/mlm-games/vitsel-clap"
+          url="https://github.com/mlm-games/samplo-clap"
           license=('MIT')
           depends=('glibc')
           optdepends=('clap-host: A CLAP host to load the plugin (not required by yadaw)')
-          provides=('vitsel-clap')
-          conflicts=('vitsel-clap')
+          provides=('samplo-clap')
+          conflicts=('samplo-clap')
           options=('!strip')
 
-          source=("Vitsel-${pkgver}.clap::https://github.com/mlm-games/vitsel-clap/releases/download/v${pkgver}/Vitsel-linux.clap")
+          source=("Samplo-${pkgver}.clap::https://github.com/mlm-games/samplo-clap/releases/download/v${pkgver}/Samplo-linux.clap")
           sha256sums=('{{HASH}}')
 
           package() {
-            install -Dm755 "${srcdir}/Vitsel-${pkgver}.clap" \
-              "${pkgdir}/usr/lib/clap/Vitsel.clap"
+            install -Dm755 "${srcdir}/Samplo-${pkgver}.clap" \
+              "${pkgdir}/usr/lib/clap/Samplo.clap"
           }
           EOF
 
@@ -130,7 +130,7 @@ jobs:
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@master
         with:
-          pkgname: vitsel-clap-bin
+          pkgname: samplo-clap-bin
           pkgbuild: aur-package/PKGBUILD
           commit_username: MLM-stuff
           commit_email: gfxoxinzh@mozmail.com

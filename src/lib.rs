@@ -1,42 +1,56 @@
 mod dsp;
+mod loader;
 mod params;
-mod presets;
+mod sample;
+mod sfz;
 mod voice;
 
 use nih_plug::prelude::*;
+use params::{FilterModeParam, SamploParams};
+use sample::{Instrument, RoundRobinState};
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
-
-use params::*;
 use voice::Voice;
 
-pub struct Vitsel {
-    params: Arc<VitsParams>,
+const MAX_VOICES: usize = 64;
+
+pub struct Samplo {
+    params: Arc<SamploParams>,
     sample_rate: f32,
     voices: Vec<Voice>,
+    instrument: Instrument,
+    rr_state: RoundRobinState,
     frame_counter: u64,
+
+    instruments_dir: Option<PathBuf>,
+    available_instruments: Vec<PathBuf>,
+    current_instrument_idx: usize,
 }
 
-impl Default for Vitsel {
+impl Default for Samplo {
     fn default() -> Self {
-        let params = Arc::new(VitsParams::default());
         let sr = 44100.0;
-        let maxv = params.max_voices.value() as usize;
         Self {
-            params,
+            params: Arc::new(SamploParams::default()),
             sample_rate: sr,
-            voices: (0..maxv).map(|_| Voice::new(sr)).collect(),
+            voices: (0..MAX_VOICES).map(|_| Voice::new(sr)).collect(),
+            instrument: Instrument::empty(),
+            rr_state: RoundRobinState::new(),
             frame_counter: 0,
+            instruments_dir: None,
+            available_instruments: Vec::new(),
+            current_instrument_idx: 0,
         }
     }
 }
 
-impl Plugin for Vitsel {
-    const NAME: &'static str = "Vitsel";
-    const VENDOR: &'static str = "me";
-    const URL: &'static str = "https://website.com";
-    const EMAIL: &'static str = "me@website.com";
-    const VERSION: &'static str = "1.0.2";
+impl Plugin for Samplo {
+    const NAME: &'static str = "Samplo";
+    const VENDOR: &'static str = "mlm-games";
+    const URL: &'static str = "https://github.com/mlm-games/samplo-clap";
+    const EMAIL: &'static str = "me@example.com";
+    const VERSION: &'static str = "1.1.0";
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: None,
@@ -47,11 +61,11 @@ impl Plugin for Vitsel {
     }];
 
     const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
-    const MIDI_OUTPUT: MidiConfig = MidiConfig::Basic; // to send VoiceTerminated
+    const MIDI_OUTPUT: MidiConfig = MidiConfig::Basic;
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
     type SysExMessage = ();
-    type BackgroundTask = ();
+    type BackgroundTask = BackgroundTask;
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
@@ -65,20 +79,25 @@ impl Plugin for Vitsel {
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate;
 
-        // Pre-size voices
-        self.resize_voice_pool();
-
-        // Tell host the initial capacity for CLAP poly-mod
-        if <Self as ClapPlugin>::CLAP_POLY_MODULATION_CONFIG.is_some() {
-            ctx.set_current_voice_capacity(self.voices.len() as u32);
+        for voice in &mut self.voices {
+            voice.set_sample_rate(self.sample_rate);
         }
+
+        if self.instrument.regions.is_empty() {
+            self.instrument = loader::create_test_instrument(self.sample_rate);
+            nih_log!("Loaded test sine instrument");
+        }
+
+        ctx.execute(BackgroundTask::ScanInstruments);
+
         true
     }
 
     fn reset(&mut self) {
         self.frame_counter = 0;
-        for v in &mut self.voices {
-            *v = Voice::new(self.sample_rate);
+        self.rr_state.reset();
+        for voice in &mut self.voices {
+            *voice = Voice::new(self.sample_rate);
         }
     }
 
@@ -91,32 +110,30 @@ impl Plugin for Vitsel {
         self.frame_counter = self.frame_counter.wrapping_add(1);
 
         let params = self.params.clone();
-        let p_gain = &params.gain;
-        let p_cutoff = &params.cutoff_hz;
 
-        // Dynamically respond to voice count changes
-        let desired = params.max_voices.value() as usize;
-        if desired != self.voices.len() {
-            self.resize_voice_pool();
-            if <Self as ClapPlugin>::CLAP_POLY_MODULATION_CONFIG.is_some() {
-                ctx.set_current_voice_capacity(self.voices.len() as u32);
-            }
-        }
+        let desired_voices = params.max_voices.value() as usize;
+        self.resize_voice_pool(desired_voices);
 
-        let wave = params.wave.value();
-        let detune_cents = params.detune.value();
-        let osc_mix = params.osc_mix.value();
-        let q = 1.0f32 + (params.resonance.value() * 7.0);
-        let fmode = params.filter_mode.value();
+        let attack = params.attack_ms.value();
+        let decay = params.decay_ms.value();
+        let sustain = params.sustain.value();
+        let release = params.release_ms.value();
+        let cutoff = params.cutoff_hz.value();
+        let res = params.resonance.value();
+        let filter_mode = params.filter_mode.value().to_dsp();
+        let gain = params.gain.value();
+        let pan = params.pan.value();
+        let tune = params.tune_cents.value();
+        let vel_sens = params.velocity_sens.value();
 
         let mut next_event = ctx.next_event();
 
         for (sample_idx, mut frame) in buffer.iter_samples().enumerate() {
-            // Handle sample-accurate events (may call self.alloc_voice() = &mut self)
             while let Some(ev) = next_event {
                 if ev.timing() != sample_idx as u32 {
                     break;
                 }
+
                 match ev {
                     NoteEvent::NoteOn {
                         channel,
@@ -125,18 +142,7 @@ impl Plugin for Vitsel {
                         voice_id,
                         ..
                     } => {
-                        let slot = self.alloc_voice(); // OK now: no outstanding &self borrows
-                        let v = &mut self.voices[slot];
-                        v.start(
-                            channel,
-                            note,
-                            velocity,
-                            wave,
-                            detune_cents,
-                            self.sample_rate,
-                        );
-                        v.note_id = voice_id.map(|x| x as i32);
-                        v.age = self.frame_counter;
+                        self.note_on(channel, note, velocity, voice_id, tune, vel_sens);
                     }
                     NoteEvent::NoteOff {
                         channel,
@@ -144,75 +150,47 @@ impl Plugin for Vitsel {
                         voice_id,
                         ..
                     } => {
-                        for v in &mut self.voices {
-                            if v.active
-                                && v.channel == channel
-                                && v.note == note
-                                && (voice_id
-                                    .map(|id| v.note_id == Some(id as i32))
-                                    .unwrap_or(true))
-                            {
-                                v.release();
-                            }
-                        }
-                    }
-                    NoteEvent::PolyModulation {
-                        voice_id,
-                        poly_modulation_id,
-                        normalized_offset,
-                        ..
-                    } => {
-                        for v in &mut self.voices {
-                            if v.active && v.note_id == Some(voice_id as i32) {
-                                match poly_modulation_id {
-                                    1 => v.poly_gain_norm = normalized_offset,
-                                    2 => v.poly_cut_norm = normalized_offset,
-                                    _ => {}
-                                }
-                            }
-                        }
+                        self.note_off(channel, note, voice_id);
                     }
                     _ => {}
                 }
+
                 next_event = ctx.next_event();
             }
 
-            // Render
-            let mut l = 0.0f32;
-            let mut r = 0.0f32;
+            let mut out_l = 0.0f32;
+            let mut out_r = 0.0f32;
 
-            for v in &mut self.voices {
-                if !v.active {
+            for voice in &mut self.voices {
+                if !voice.active {
                     continue;
                 }
 
-                v.set_filter(
-                    q,
-                    fmode,
-                    self.sample_rate,
-                    v.poly_cut_norm * params.mod_cutoff.value(),
-                    p_cutoff,
-                );
-                let gain_plain: f32 =
-                    p_gain.preview_modulated(v.poly_gain_norm * params.mod_gain.value());
+                voice.env.set_ms(attack, decay, sustain, release);
 
-                let y = v.render(wave, osc_mix, gain_plain);
-                l += y;
-                r += y;
+                let (l, r) =
+                    voice.render(&self.instrument, cutoff, res, filter_mode, self.sample_rate);
 
-                if !v.active {
+                out_l += l;
+                out_r += r;
+
+                if !voice.active {
                     ctx.send_event(NoteEvent::VoiceTerminated {
                         timing: sample_idx as u32,
-                        voice_id: v.note_id,
-                        channel: v.channel,
-                        note: v.note,
+                        voice_id: voice.note_id,
+                        channel: voice.channel,
+                        note: voice.note,
                     });
                 }
             }
 
-            let scale = (1.0 / (self.voices.len().max(1) as f32).sqrt()).min(1.0);
-            let out_l = l * scale;
-            let out_r = r * scale;
+            let (pan_l, pan_r) = pan_to_gains(pan);
+            out_l *= gain * pan_l;
+            out_r *= gain * pan_r;
+
+            out_l = dsp::fast_tanh(out_l);
+            out_r = dsp::fast_tanh(out_r);
+
             let mut ch = frame.iter_mut();
             if let Some(s) = ch.next() {
                 *s = out_l;
@@ -224,53 +202,155 @@ impl Plugin for Vitsel {
 
         ProcessStatus::Normal
     }
+
+    fn task_executor(&mut self) -> TaskExecutor<Self> {
+        Box::new(|task| match task {
+            BackgroundTask::ScanInstruments => {
+                let paths_to_try = [
+                    PathBuf::from("./instruments"),
+                    PathBuf::from("/storage/emulated/0/Samplo/instruments"),
+                    dirs::document_dir()
+                        .map(|d| d.join("Samplo/instruments"))
+                        .unwrap_or_default(),
+                ];
+
+                for path in paths_to_try {
+                    if path.exists() {
+                        nih_log!("Found instruments dir: {:?}", path);
+                        break;
+                    }
+                }
+            }
+            BackgroundTask::LoadInstrument(path) => {
+                nih_log!("Loading instrument: {:?}", path);
+            }
+        })
+    }
 }
 
-impl Vitsel {
-    fn resize_voice_pool(&mut self) {
-        let n = self.params.max_voices.value() as usize;
-        if n > self.voices.len() {
+pub enum BackgroundTask {
+    ScanInstruments,
+    LoadInstrument(PathBuf),
+}
+
+impl Samplo {
+    fn resize_voice_pool(&mut self, target: usize) {
+        let target = target.min(MAX_VOICES);
+        if target > self.voices.len() {
             self.voices
-                .extend((self.voices.len()..n).map(|_| Voice::new(self.sample_rate)));
-        } else {
-            self.voices.truncate(n);
+                .extend((self.voices.len()..target).map(|_| Voice::new(self.sample_rate)));
+        } else if target < self.voices.len() {
+            self.voices.truncate(target);
         }
     }
+
     fn alloc_voice(&mut self) -> usize {
         if let Some(i) = self.voices.iter().position(|v| !v.active) {
             return i;
         }
-        let (mut best_i, mut best_age) = (0usize, u64::MAX);
+
+        let mut oldest_idx = 0;
+        let mut oldest_age = u64::MAX;
         for (i, v) in self.voices.iter().enumerate() {
-            if v.age < best_age {
-                best_age = v.age;
-                best_i = i;
+            if v.age < oldest_age {
+                oldest_age = v.age;
+                oldest_idx = i;
             }
         }
-        best_i
+        oldest_idx
+    }
+
+    fn note_on(
+        &mut self,
+        channel: u8,
+        note: u8,
+        velocity: f32,
+        voice_id: Option<i32>,
+        tune_cents: f32,
+        vel_sens: f32,
+    ) {
+        let midi_vel = (velocity * 127.0) as u8;
+
+        // Find matching region with round robin
+        let region_idx = match self
+            .instrument
+            .find_region(note, midi_vel, &mut self.rr_state)
+        {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        let region = &self.instrument.regions[region_idx];
+
+        let tune_ratio = 2.0f64.powf(tune_cents as f64 / 1200.0);
+        let playback_rate = region.playback_rate(note, self.sample_rate) * tune_ratio;
+
+        let vel_amount = 1.0 - vel_sens + vel_sens * velocity;
+
+        let slot = self.alloc_voice();
+        let voice = &mut self.voices[slot];
+        voice.start(
+            channel,
+            note,
+            vel_amount,
+            region_idx,
+            playback_rate,
+            self.frame_counter,
+        );
+        voice.note_id = voice_id;
+    }
+
+    fn note_off(&mut self, channel: u8, note: u8, voice_id: Option<i32>) {
+        for voice in &mut self.voices {
+            if voice.active
+                && voice.channel == channel
+                && voice.note == note
+                && (voice_id.is_none() || voice.note_id == voice_id)
+            {
+                voice.release();
+            }
+        }
+    }
+
+    /// Load an instrument from a path (JSON or SFZ)
+    pub fn load_instrument_from_path(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        let instrument = match ext {
+            "json" => loader::load_instrument_json(path)?,
+            "sfz" => sfz::load_sfz(path)?,
+            _ => return Err(format!("Unknown format: {}", ext)),
+        };
+
+        self.instrument = instrument;
+        self.rr_state.reset();
+        nih_log!("Loaded instrument: {}", self.instrument.name);
+
+        Ok(())
     }
 }
 
-// CLAP metadata
-impl ClapPlugin for Vitsel {
-    const CLAP_ID: &'static str = "dev.example.vitsel";
-    const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Minimal production-ready CLAP synth for Android/desktop.");
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
-        ClapFeature::Instrument,
-        ClapFeature::Synthesizer,
-        ClapFeature::Stereo,
-    ];
-    const CLAP_POLY_MODULATION_CONFIG: Option<PolyModulationConfig> = Some(PolyModulationConfig {
-        max_voice_capacity: 64,
-        supports_overlapping_voices: true,
-    });
-
-    fn remote_controls(&self, context: &mut impl RemoteControlsContext) {}
-
-    const CLAP_MANUAL_URL: Option<&'static str> = { Some("Not yet") };
-
-    const CLAP_SUPPORT_URL: Option<&'static str> = { Some("Not yet") };
+#[inline]
+fn pan_to_gains(pan: f32) -> (f32, f32) {
+    let x = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
+    let theta = x * core::f32::consts::FRAC_PI_2;
+    (theta.cos(), theta.sin())
 }
 
-nih_export_clap!(Vitsel);
+impl ClapPlugin for Samplo {
+    const CLAP_ID: &'static str = "dev.mlm-games.samplo";
+    const CLAP_DESCRIPTION: Option<&'static str> =
+        Some("Minimal sample player with SFZ support for Android and desktop");
+    const CLAP_FEATURES: &'static [ClapFeature] = &[
+        ClapFeature::Instrument,
+        ClapFeature::Sampler,
+        ClapFeature::Stereo,
+    ];
+
+    fn remote_controls(&self, _context: &mut impl RemoteControlsContext) {}
+
+    const CLAP_MANUAL_URL: Option<&'static str> = None;
+    const CLAP_SUPPORT_URL: Option<&'static str> = None;
+}
+
+nih_export_clap!(Samplo);
