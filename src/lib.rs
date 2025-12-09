@@ -346,7 +346,7 @@ impl Samplo {
             }
 
             nih_log!("Samplo: searching instruments in {:?}", dir);
-            for path in scan_instruments(dir) {
+            for path in scan_instruments(dir, 2) {
                 let name = path
                     .file_stem()
                     .and_then(|s| s.to_str())

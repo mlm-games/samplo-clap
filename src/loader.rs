@@ -1,7 +1,7 @@
 use crate::sample::{Instrument, InstrumentDef, Region, RegionDef};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use symphonia::core::audio::{AudioBufferRef, Signal};
@@ -225,37 +225,42 @@ fn load_region(sample_path: &Path, def: &RegionDef) -> Result<Region, String> {
 }
 
 /// Scan a directory for instrument files (.json or .sfz)
-/// Looks at top level AND one subdirectory deep
-pub fn scan_instruments(dir: &Path) -> Vec<std::path::PathBuf> {
+/// Setting the max depth to two to cover git repos (like https://github.com/sfzinstruments 's instruments)
+pub fn scan_instruments(dir: &Path, max_depth: usize) -> Vec<PathBuf> {
     let mut found = Vec::new();
+    scan_recursive(dir, 0, max_depth, &mut found);
+    found.sort();
+    found
+}
 
+fn scan_recursive(dir: &Path, current_depth: usize, max_depth: usize, found: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return found;
+        return;
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
 
-        if path.is_file() {
-            // Top-level instrument file
-            if is_instrument_file(&path) {
-                found.push(path);
-            }
-        } else if path.is_dir() {
-            // Scan one level deep into subdirectories
-            if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                for sub_entry in sub_entries.flatten() {
-                    let sub_path = sub_entry.path();
-                    if sub_path.is_file() && is_instrument_file(&sub_path) {
-                        found.push(sub_path);
-                    }
-                }
+        // Skips hidden directories
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if path.is_file() && is_instrument_file(&path) {
+            found.push(path);
+        } else if path.is_dir() && current_depth < max_depth {
+            // Skip common non-instrument directories
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !matches!(name.to_lowercase().as_str(), "samples" | "waves" | "audio") {
+                scan_recursive(&path, current_depth + 1, max_depth, found);
             }
         }
     }
-
-    found.sort();
-    found
 }
 
 #[inline]
