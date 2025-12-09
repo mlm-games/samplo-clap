@@ -11,24 +11,6 @@ use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// Supported audio formats
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioFormat {
-    Wav,
-    Flac,
-    Unknown,
-}
-
-impl AudioFormat {
-    pub fn from_path(path: &Path) -> Self {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("wav") | Some("WAV") => AudioFormat::Wav,
-            Some("flac") | Some("FLAC") => AudioFormat::Flac,
-            _ => AudioFormat::Unknown,
-        }
-    }
-}
-
 /// Loaded audio data
 pub struct AudioData {
     pub samples: Vec<f32>,
@@ -37,16 +19,17 @@ pub struct AudioData {
     pub num_frames: usize,
 }
 
-/// Load an audio file (WAV or FLAC) using Symphonia
+/// Load an audio file using Symphonia
 pub fn load_audio(path: &Path) -> Result<AudioData, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    let file = File::open(path).map_err(|e| format!("Cannot open '{}': {}", path.display(), e))?;
+
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
 
     let mss = MediaSourceStream::new(
         Box::new(ReadOnlySource::new(BufReader::new(file))),
         Default::default(),
     );
 
-    // Provide format hint based on extension
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
@@ -58,33 +41,44 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
 
     let probed = symphonia::default::get_probe()
         .format(&hint, mss, &format_opts, &metadata_opts)
-        .map_err(|e| format!("Failed to probe {}: {}", path.display(), e))?;
+        .map_err(|e| {
+            format!(
+                "Cannot identify format of '{}' ({} bytes): {}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                file_size,
+                e
+            )
+        })?;
 
     let mut format = probed.format;
 
-    // Get the default track
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        .ok_or_else(|| format!("No audio track in {}", path.display()))?;
+        .ok_or_else(|| format!("No audio track in '{}'", path.display()))?;
 
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
 
     let channels = codec_params.channels.map(|c| c.count()).unwrap_or(1);
-
     let sample_rate = codec_params
         .sample_rate
-        .ok_or_else(|| "Unknown sample rate".to_string())?;
+        .ok_or_else(|| format!("Unknown sample rate in '{}'", path.display()))?;
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &decoder_opts)
-        .map_err(|e| format!("Failed to create decoder: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "No decoder for '{}' (codec {:?}): {}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                codec_params.codec,
+                e
+            )
+        })?;
 
     let mut samples: Vec<f32> = Vec::new();
 
-    // Decode all packets
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -93,7 +87,11 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
             {
                 break;
             }
-            Err(e) => return Err(format!("Decode error: {}", e)),
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Some formats need a reset, try to continue
+                continue;
+            }
+            Err(_) => break,
         };
 
         if packet.track_id() != track_id {
@@ -103,10 +101,18 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-            Err(e) => return Err(format!("Decode error: {}", e)),
+            Err(_) => continue,
         };
 
         append_samples(&decoded, &mut samples, channels);
+    }
+
+    if samples.is_empty() {
+        return Err(format!(
+            "No audio data decoded from '{}' ({} bytes)",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            file_size
+        ));
     }
 
     let num_frames = samples.len() / channels;
@@ -160,9 +166,7 @@ fn append_samples(buffer: &AudioBufferRef, out: &mut Vec<f32>, channels: usize) 
                 }
             }
         }
-        _ => {
-            // Other formats - skip silently
-        }
+        _ => {}
     }
 }
 
@@ -182,7 +186,7 @@ pub fn load_instrument_json(def_path: &Path) -> Result<Instrument, String> {
         match load_region(&sample_path, region_def) {
             Ok(region) => regions.push(region),
             Err(e) => {
-                eprintln!("Warning: {}", e);
+                nih_plug::nih_log!("Warning: {}", e);
             }
         }
     }

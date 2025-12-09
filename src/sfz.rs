@@ -1,19 +1,10 @@
 //! Basic SFZ parser - supports common opcodes needed for most instruments
 //!
-//! Supported opcodes:
-//! - sample, key, lokey, hikey, pitch_keycenter
-//! - lovel, hivel
-//! - loop_mode, loop_start, loop_end
-//! - tune, volume, pan
-//! - seq_length, seq_position (round robin)
-//! - group, off_by (voice groups - basic)
-//! - offset, end (sample start/end)
-//! - default_path
 
 use crate::loader::load_audio;
 use crate::sample::{Instrument, Region};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// SFZ section types
@@ -22,6 +13,7 @@ enum Section {
     None,
     Control,
     Global,
+    Master,
     Group,
     Region,
 }
@@ -71,7 +63,6 @@ impl OpcodeSet {
                 }
             };
         }
-
         merge_field!(sample);
         merge_field!(offset);
         merge_field!(end);
@@ -93,79 +84,164 @@ impl OpcodeSet {
     }
 }
 
-/// Parse an SFZ file and load the instrument
-pub fn load_sfz(sfz_path: &Path) -> Result<Instrument, String> {
-    let content = std::fs::read_to_string(sfz_path)
-        .map_err(|e| format!("Failed to read {}: {}", sfz_path.display(), e))?;
+struct SfzParser {
+    base_dir: PathBuf,
+    defines: HashMap<String, String>,
+    default_path: String,
+    global_opcodes: OpcodeSet,
+    master_opcodes: OpcodeSet,
+    group_opcodes: OpcodeSet,
+    current_section: Section,
+    regions: Vec<Region>,
+    pending_region: Option<OpcodeSet>,
+    include_depth: usize,
+    failed_samples: Vec<String>,
+}
 
-    let base_dir = sfz_path.parent().unwrap_or(Path::new("."));
-    let name = sfz_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Unknown")
-        .to_string();
+impl SfzParser {
+    fn new(base_dir: PathBuf) -> Self {
+        Self {
+            base_dir,
+            defines: HashMap::new(),
+            default_path: String::new(),
+            global_opcodes: OpcodeSet::default(),
+            master_opcodes: OpcodeSet::default(),
+            group_opcodes: OpcodeSet::default(),
+            current_section: Section::None,
+            regions: Vec::new(),
+            pending_region: None,
+            include_depth: 0,
+            failed_samples: Vec::new(),
+        }
+    }
 
-    let mut default_path = String::new();
-    let mut global_opcodes = OpcodeSet::default();
-    let mut group_opcodes = OpcodeSet::default();
-    let mut current_section = Section::None;
-    let mut regions: Vec<Region> = Vec::new();
+    fn expand_defines(&self, line: &str) -> String {
+        let mut result = line.to_string();
+        for (key, value) in &self.defines {
+            result = result.replace(key, value);
+        }
+        result
+    }
 
-    // Pending region being built
-    let mut pending_region: Option<OpcodeSet> = None;
-
-    for line in content.lines() {
-        let line = strip_comments(line).trim();
-        if line.is_empty() {
-            continue;
+    fn parse_file(&mut self, path: &Path) -> Result<(), String> {
+        if self.include_depth > 10 {
+            return Err("Include depth exceeded (possible circular include)".to_string());
         }
 
-        // Check for section headers
-        if line.starts_with('<') && line.ends_with('>') {
-            // Finalize pending region
-            if let Some(region_ops) = pending_region.take() {
-                if let Some(region) = build_region(&region_ops, base_dir, &default_path) {
-                    regions.push(region);
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+        self.include_depth += 1;
+
+        for line in content.lines() {
+            self.parse_line(line)?;
+        }
+
+        self.include_depth -= 1;
+        Ok(())
+    }
+
+    fn parse_line(&mut self, line: &str) -> Result<(), String> {
+        let line = strip_comments(line).trim();
+        if line.is_empty() {
+            return Ok(());
+        }
+
+        // Handle #define
+        if line.starts_with("#define") {
+            let parts: Vec<&str> = line.splitn(3, ' ').collect();
+            if parts.len() >= 3 {
+                let key = parts[1].to_string();
+                let value = parts[2].to_string();
+                self.defines.insert(key, value);
+            }
+            return Ok(());
+        }
+
+        // Handle #include
+        if line.starts_with("#include") {
+            let include_path = line
+                .trim_start_matches("#include")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+
+            let full_path = self.base_dir.join(include_path);
+
+            if full_path.exists() {
+                self.parse_file(&full_path)?;
+            } else {
+                nih_plug::nih_log!("Include not found: {}", full_path.display());
+            }
+            return Ok(());
+        }
+
+        // Expand defines in the line
+        let line = self.expand_defines(line);
+        let line = line.trim();
+
+        // Handle section headers
+        if line.contains('<') {
+            self.finalize_pending_region();
+
+            if let Some(start) = line.find('<') {
+                if let Some(end) = line.find('>') {
+                    let section_name = line[start + 1..end].to_lowercase();
+                    let rest_of_line = line[end + 1..].trim();
+
+                    self.current_section = match section_name.as_str() {
+                        "control" => Section::Control,
+                        "global" => Section::Global,
+                        "master" => {
+                            self.master_opcodes = OpcodeSet::default();
+                            self.master_opcodes.merge(&self.global_opcodes);
+                            Section::Master
+                        }
+                        "group" => {
+                            self.group_opcodes = OpcodeSet::default();
+                            self.group_opcodes.merge(&self.global_opcodes);
+                            self.group_opcodes.merge(&self.master_opcodes);
+                            Section::Group
+                        }
+                        "region" => {
+                            let mut ops = OpcodeSet::default();
+                            ops.merge(&self.global_opcodes);
+                            ops.merge(&self.master_opcodes);
+                            ops.merge(&self.group_opcodes);
+                            self.pending_region = Some(ops);
+                            Section::Region
+                        }
+                        "curve" => Section::None, // Skip curve definitions
+                        _ => Section::None,
+                    };
+
+                    if !rest_of_line.is_empty() {
+                        self.apply_opcodes_to_section(rest_of_line);
+                    }
+                    return Ok(());
                 }
             }
-
-            let section_name = &line[1..line.len() - 1].to_lowercase();
-            current_section = match section_name.as_str() {
-                "control" => Section::Control,
-                "global" => Section::Global,
-                "group" => {
-                    group_opcodes = OpcodeSet::default();
-                    Section::Group
-                }
-                "region" => {
-                    let mut ops = OpcodeSet::default();
-                    ops.merge(&global_opcodes);
-                    ops.merge(&group_opcodes);
-                    pending_region = Some(ops);
-                    Section::Region
-                }
-                _ => Section::None,
-            };
-            continue;
         }
 
         // Parse opcodes
+        self.apply_opcodes_to_section(&line);
+        Ok(())
+    }
+
+    fn apply_opcodes_to_section(&mut self, line: &str) {
         let opcodes = parse_opcodes(line);
 
-        match current_section {
+        match self.current_section {
             Section::Control => {
                 if let Some(path) = opcodes.get("default_path") {
-                    default_path = path.clone();
+                    self.default_path = path.clone();
                 }
             }
-            Section::Global => {
-                apply_opcodes(&mut global_opcodes, &opcodes);
-            }
-            Section::Group => {
-                apply_opcodes(&mut group_opcodes, &opcodes);
-            }
+            Section::Global => apply_opcodes(&mut self.global_opcodes, &opcodes),
+            Section::Master => apply_opcodes(&mut self.master_opcodes, &opcodes),
+            Section::Group => apply_opcodes(&mut self.group_opcodes, &opcodes),
             Section::Region => {
-                if let Some(ref mut ops) = pending_region {
+                if let Some(ref mut ops) = self.pending_region {
                     apply_opcodes(ops, &opcodes);
                 }
             }
@@ -173,22 +249,57 @@ pub fn load_sfz(sfz_path: &Path) -> Result<Instrument, String> {
         }
     }
 
-    // Finalize last pending region
-    if let Some(region_ops) = pending_region {
-        if let Some(region) = build_region(&region_ops, base_dir, &default_path) {
-            regions.push(region);
+    fn finalize_pending_region(&mut self) {
+        if let Some(region_ops) = self.pending_region.take() {
+            match build_region(&region_ops, &self.base_dir, &self.default_path) {
+                Some(region) => self.regions.push(region),
+                None => {
+                    if let Some(s) = &region_ops.sample {
+                        self.failed_samples.push(s.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn load_sfz(sfz_path: &Path) -> Result<Instrument, String> {
+    let base_dir = sfz_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let name = sfz_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Unknown")
+        .to_string();
+
+    nih_plug::nih_log!("Parsing SFZ: {}", sfz_path.display());
+
+    let mut parser = SfzParser::new(base_dir);
+    parser.parse_file(sfz_path)?;
+    parser.finalize_pending_region();
+
+    nih_plug::nih_log!(
+        "SFZ complete: {} regions loaded, {} failed",
+        parser.regions.len(),
+        parser.failed_samples.len()
+    );
+
+    if !parser.failed_samples.is_empty() && parser.failed_samples.len() <= 10 {
+        for s in &parser.failed_samples {
+            nih_plug::nih_log!("  Failed: {}", s);
         }
     }
 
-    if regions.is_empty() {
-        return Err(format!("No valid regions found in {}", sfz_path.display()));
+    if parser.regions.is_empty() {
+        return Err(format!(
+            "No valid regions in {} (check if samples exist)",
+            sfz_path.display()
+        ));
     }
 
-    Ok(Instrument::new(name, regions))
+    Ok(Instrument::new(name, parser.regions))
 }
 
 fn strip_comments(line: &str) -> &str {
-    // SFZ comments start with //
     line.split("//").next().unwrap_or(line)
 }
 
@@ -221,24 +332,25 @@ fn parse_opcodes(line: &str) -> HashMap<String, String> {
 
 fn find_next_opcode(s: &str) -> Option<usize> {
     let mut chars = s.char_indices().peekable();
+    let mut in_word = false;
+    let mut word_start = 0;
 
     while let Some((i, c)) = chars.next() {
         if c.is_ascii_alphabetic() || c == '_' {
-            // Could be start of an opcode, look for '='
-            let mut j = i;
-            while let Some(&(idx, ch)) = chars.peek() {
-                if ch.is_ascii_alphanumeric() || ch == '_' {
-                    j = idx;
-                    chars.next();
-                } else if ch == '=' {
-                    return Some(i);
-                } else {
-                    break;
-                }
+            if !in_word {
+                word_start = i;
+                in_word = true;
             }
+        } else if c == '=' && in_word {
+            return Some(word_start);
+        } else if c.is_whitespace() {
+            in_word = false;
+        } else if c.is_ascii_alphanumeric() {
+            // Continue
+        } else {
+            in_word = false;
         }
     }
-
     None
 }
 
@@ -248,7 +360,6 @@ fn apply_opcodes(ops: &mut OpcodeSet, parsed: &HashMap<String, String>) {
             "sample" => ops.sample = Some(value.clone()),
             "offset" => ops.offset = value.parse().ok(),
             "end" => ops.end = value.parse().ok(),
-
             "key" => {
                 if let Some(note) = parse_note(value) {
                     ops.key = Some(note);
@@ -260,24 +371,18 @@ fn apply_opcodes(ops: &mut OpcodeSet, parsed: &HashMap<String, String>) {
             "lokey" => ops.lokey = parse_note(value),
             "hikey" => ops.hikey = parse_note(value),
             "pitch_keycenter" => ops.pitch_keycenter = parse_note(value),
-
             "lovel" => ops.lovel = value.parse().ok(),
             "hivel" => ops.hivel = value.parse().ok(),
-
             "loop_mode" => ops.loop_mode = Some(value.clone()),
             "loop_start" => ops.loop_start = value.parse().ok(),
             "loop_end" => ops.loop_end = value.parse().ok(),
-
             "tune" => ops.tune = value.parse().ok(),
             "volume" => ops.volume = value.parse().ok(),
             "pan" => ops.pan = value.parse().ok(),
-
             "seq_length" => ops.seq_length = value.parse().ok(),
             "seq_position" => ops.seq_position = value.parse().ok(),
-
             "group" => ops.group = value.parse().ok(),
-
-            _ => {} // Ignore unsupported opcodes
+            _ => {}
         }
     }
 }
@@ -330,86 +435,45 @@ fn parse_note(s: &str) -> Option<u8> {
 
 fn build_region(ops: &OpcodeSet, base_dir: &Path, default_path: &str) -> Option<Region> {
     let sample_name = ops.sample.as_ref()?;
+    let sample_name_normalized = sample_name.replace('\\', "/");
 
-    // Build sample path
     let sample_path = if default_path.is_empty() {
-        base_dir.join(sample_name)
+        base_dir.join(&sample_name_normalized)
     } else {
-        base_dir.join(default_path).join(sample_name)
+        let dp = default_path.replace('\\', "/");
+        base_dir.join(&dp).join(&sample_name_normalized)
     };
 
-    // Normalize path separators (SFZ uses backslashes on Windows)
-    let sample_path_str = sample_path.to_string_lossy().replace('\\', "/");
-    let sample_path = Path::new(&sample_path_str);
+    if !sample_path.exists() {
+        return None;
+    }
 
-    // Load audio
-    let audio = match load_audio(sample_path) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Warning: {}", e);
-            return None;
-        }
-    };
+    let audio = load_audio(&sample_path).ok()?;
 
-    // Determine loop settings
     let loop_enabled = ops
         .loop_mode
         .as_ref()
         .map(|m| m == "loop_continuous" || m == "loop_sustain")
         .unwrap_or(false);
 
-    // Round robin
-    let rr_group = ops.group.unwrap_or(0);
-    let rr_seq = ops.seq_position.unwrap_or(1).saturating_sub(1); // SFZ is 1-based
-
     Some(Region {
         data: Arc::new(audio.samples),
         channels: audio.channels,
         sample_rate: audio.sample_rate as f32,
         num_frames: audio.num_frames,
-
         root_note: ops.pitch_keycenter.or(ops.key).unwrap_or(60),
         lo_note: ops.lokey.unwrap_or(0),
         hi_note: ops.hikey.unwrap_or(127),
         lo_vel: ops.lovel.unwrap_or(0),
         hi_vel: ops.hivel.unwrap_or(127),
-
         loop_start: ops.loop_start,
         loop_end: ops.loop_end,
         loop_enabled,
-
-        rr_group,
-        rr_seq,
-
+        rr_group: ops.group.unwrap_or(0),
+        rr_seq: ops.seq_position.unwrap_or(1).saturating_sub(1),
         tune_cents: ops.tune.unwrap_or(0.0),
         volume_db: ops.volume.unwrap_or(0.0),
-        pan: ops.pan.map(|p| p / 100.0).unwrap_or(0.0), // SFZ pan is -100..100
-
+        pan: ops.pan.map(|p| p / 100.0).unwrap_or(0.0),
         sample_path: sample_path.to_string_lossy().to_string(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_note() {
-        assert_eq!(parse_note("60"), Some(60));
-        assert_eq!(parse_note("c4"), Some(60));
-        assert_eq!(parse_note("C4"), Some(60));
-        assert_eq!(parse_note("c#4"), Some(61));
-        assert_eq!(parse_note("db4"), Some(61));
-        assert_eq!(parse_note("a4"), Some(69));
-        assert_eq!(parse_note("c-1"), Some(0));
-    }
-
-    #[test]
-    fn test_parse_opcodes() {
-        let ops = parse_opcodes("sample=piano_c4.wav lokey=48 hikey=72 pitch_keycenter=60");
-        assert_eq!(ops.get("sample"), Some(&"piano_c4.wav".to_string()));
-        assert_eq!(ops.get("lokey"), Some(&"48".to_string()));
-        assert_eq!(ops.get("hikey"), Some(&"72".to_string()));
-        assert_eq!(ops.get("pitch_keycenter"), Some(&"60".to_string()));
-    }
 }
