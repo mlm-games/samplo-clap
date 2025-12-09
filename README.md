@@ -2,9 +2,13 @@
 
 A minimal Rust CLAP sampler with SFZ support, running headless on Android (yadaw) and desktop hosts.
 
+## Usage
+
+Place your sfz (or json) in the Documents dir's Samplo/instruments directory, and use the instrument setting to control which instrument is loaded (always sorted alphabetically, enable logging (info) to find which instrument was selected)
+
 ## Features
 
-- **Audio formats**: WAV, FLAC (via Symphonia)
+- **Audio formats**: WAV, FLAC, OGG, Ogg Vorbis (via Symphonia)
 - **Instrument formats**: JSON, SFZ
 - **Multi-sample mapping**: Note and velocity layers
 - **Round robin**: Automatic sample cycling for realistic playback
