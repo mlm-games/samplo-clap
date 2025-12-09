@@ -225,15 +225,30 @@ fn load_region(sample_path: &Path, def: &RegionDef) -> Result<Region, String> {
 }
 
 /// Scan a directory for instrument files (.json or .sfz)
+/// Looks at top level AND one subdirectory deep
 pub fn scan_instruments(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext == "json" || ext == "sfz" {
-                    found.push(path);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_file() {
+            // Top-level instrument file
+            if is_instrument_file(&path) {
+                found.push(path);
+            }
+        } else if path.is_dir() {
+            // Scan one level deep into subdirectories
+            if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                for sub_entry in sub_entries.flatten() {
+                    let sub_path = sub_entry.path();
+                    if sub_path.is_file() && is_instrument_file(&sub_path) {
+                        found.push(sub_path);
+                    }
                 }
             }
         }
@@ -241,6 +256,17 @@ pub fn scan_instruments(dir: &Path) -> Vec<std::path::PathBuf> {
 
     found.sort();
     found
+}
+
+#[inline]
+fn is_instrument_file(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            let ext_lower = ext.to_lowercase();
+            ext_lower == "sfz" || ext_lower == "json"
+        }
+        None => false,
+    }
 }
 
 /// Create a test instrument with a sine wave
