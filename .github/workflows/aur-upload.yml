@@ -101,7 +101,7 @@ jobs:
           _pkgname=samplo
           pkgver={{VER}}
           pkgrel={{PKGREL}}
-          pkgdesc="Minimal Rust CLAP synth with PolyBLEP oscillators, ADSR, and zero-delay TPT SVF"
+          pkgdesc="Headless Rust CLAP sfz instrument loader (basic)"
           arch=('x86_64')
           url="https://github.com/mlm-games/samplo-clap"
           license=('MIT')
