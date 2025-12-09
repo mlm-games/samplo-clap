@@ -6,11 +6,11 @@ mod sfz;
 mod voice;
 
 use nih_plug::prelude::*;
-use params::{FilterModeParam, SamploParams};
+use params::SamploParams;
 use sample::{Instrument, RoundRobinState};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use voice::Voice;
 
 const MAX_VOICES: usize = 64;
@@ -23,8 +23,6 @@ pub struct Samplo {
     rr_state: RoundRobinState,
     frame_counter: u64,
 
-    instruments_dir: Option<PathBuf>,
-    available_instruments: Vec<PathBuf>,
     current_instrument_idx: usize,
 }
 
@@ -38,8 +36,6 @@ impl Default for Samplo {
             instrument: Instrument::empty(),
             rr_state: RoundRobinState::new(),
             frame_counter: 0,
-            instruments_dir: None,
-            available_instruments: Vec::new(),
             current_instrument_idx: 0,
         }
     }
@@ -75,7 +71,7 @@ impl Plugin for Samplo {
         &mut self,
         _io: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        ctx: &mut impl InitContext<Self>,
+        _ctx: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate;
 
@@ -83,12 +79,12 @@ impl Plugin for Samplo {
             voice.set_sample_rate(self.sample_rate);
         }
 
+        self.scan_and_register_instruments();
+
         if self.instrument.regions.is_empty() {
             self.instrument = loader::create_test_instrument(self.sample_rate);
             nih_log!("Loaded test sine instrument");
         }
-
-        ctx.execute(BackgroundTask::ScanInstruments);
 
         true
     }
@@ -110,6 +106,24 @@ impl Plugin for Samplo {
         self.frame_counter = self.frame_counter.wrapping_add(1);
 
         let params = self.params.clone();
+
+        let inst_idx = params.instrument_index.value().max(0) as usize;
+        if inst_idx != self.current_instrument_idx {
+            self.current_instrument_idx = inst_idx;
+
+            let list = instruments().lock().unwrap();
+            if let Some(slot) = list.get(self.current_instrument_idx) {
+                match self.load_instrument_from_path(&slot.path) {
+                    Ok(()) => {
+                        self.rr_state.reset();
+                        nih_log!("Samplo: loaded instrument '{}'", slot.name);
+                    }
+                    Err(e) => {
+                        nih_log!("Samplo: failed to load instrument {:?}: {}", slot.path, e);
+                    }
+                }
+            }
+        }
 
         let desired_voices = params.max_voices.value() as usize;
         self.resize_voice_pool(desired_voices);
@@ -205,22 +219,6 @@ impl Plugin for Samplo {
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         Box::new(|task| match task {
-            BackgroundTask::ScanInstruments => {
-                let paths_to_try = [
-                    PathBuf::from("./instruments"),
-                    PathBuf::from("/storage/emulated/0/Samplo/instruments"),
-                    dirs::document_dir()
-                        .map(|d| d.join("Samplo/instruments"))
-                        .unwrap_or_default(),
-                ];
-
-                for path in paths_to_try {
-                    if path.exists() {
-                        nih_log!("Found instruments dir: {:?}", path);
-                        break;
-                    }
-                }
-            }
             BackgroundTask::LoadInstrument(path) => {
                 nih_log!("Loading instrument: {:?}", path);
             }
@@ -229,7 +227,6 @@ impl Plugin for Samplo {
 }
 
 pub enum BackgroundTask {
-    ScanInstruments,
     LoadInstrument(PathBuf),
 }
 
@@ -328,6 +325,45 @@ impl Samplo {
 
         Ok(())
     }
+
+    /// Scan for instrument definition files and populate the global instrument list.
+    fn scan_and_register_instruments(&mut self) {
+        use crate::loader::scan_instruments;
+
+        let paths_to_try = [
+            PathBuf::from("./instruments"),
+            PathBuf::from("/storage/emulated/0/Samplo/instruments"),
+            dirs::document_dir()
+                .map(|d| d.join("Samplo/instruments"))
+                .unwrap_or_default(),
+        ];
+
+        let mut slots = Vec::new();
+
+        for dir in &paths_to_try {
+            if !dir.exists() {
+                continue;
+            }
+
+            nih_log!("Samplo: searching instruments in {:?}", dir);
+            for path in scan_instruments(dir) {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+                slots.push(InstrumentSlot { name, path });
+            }
+        }
+
+        if !slots.is_empty() {
+            let mut g = instruments().lock().unwrap();
+            *g = slots;
+            nih_log!("Samplo: found {} instruments", g.len());
+        } else {
+            nih_log!("Samplo: no instruments found, using test sine");
+        }
+    }
 }
 
 #[inline]
@@ -354,3 +390,30 @@ impl ClapPlugin for Samplo {
 }
 
 nih_export_clap!(Samplo);
+
+/// One available instrument on disk
+#[derive(Clone)]
+pub struct InstrumentSlot {
+    pub name: String,  // Display name (e.g. file stem)
+    pub path: PathBuf, // Full path to .sfz/.json
+}
+
+/// Global list of discovered instruments, shared across plugin instances.
+static GLOBAL_INSTRUMENTS: OnceLock<Mutex<Vec<InstrumentSlot>>> = OnceLock::new();
+
+fn instruments() -> &'static Mutex<Vec<InstrumentSlot>> {
+    GLOBAL_INSTRUMENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Helper used by the param's `value_to_string`:
+/// map an index to a human‑readable instrument name.
+pub fn instrument_name_for_index(idx: i32) -> String {
+    let list = instruments().lock().unwrap();
+    if list.is_empty() {
+        return "None".to_string();
+    }
+    let clamped = idx.clamp(0, list.len().saturating_sub(1) as i32) as usize;
+    list.get(clamped)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "None".to_string())
+}

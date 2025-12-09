@@ -33,6 +33,10 @@ pub struct SamploParams {
     pub max_voices: IntParam,
     #[id = "vel_sens"]
     pub velocity_sens: FloatParam,
+
+    /// Instrument selection (idx into scanned instrument list)
+    #[id = "inst"]
+    pub instrument_index: IntParam,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Enum)]
@@ -125,6 +129,12 @@ impl Default for SamploParams {
                 0.7,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             ),
+
+            instrument_index: {
+                use std::sync::Arc;
+                IntParam::new("Instrument", 0, IntRange::Linear { min: 0, max: 127 })
+                    .with_value_to_string(Arc::new(|idx| crate::instrument_name_for_index(idx)))
+            },
         }
     }
 }
