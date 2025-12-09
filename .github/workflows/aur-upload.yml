@@ -101,7 +101,7 @@ jobs:
           _pkgname=samplo
           pkgver={{VER}}
           pkgrel={{PKGREL}}
-          pkgdesc="Headless Rust CLAP sfz instrument loader (basic)"
+          pkgdesc="Headless Rust CLAP sfz instrument loader (similar to Sforzando but without an UI and basic sfz support)"
           arch=('x86_64')
           url="https://github.com/mlm-games/samplo-clap"
           license=('MIT')
