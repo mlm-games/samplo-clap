@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      mark_prerelease:
+        description: "Mark as prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version in Cargo.toml
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_TOML="Cargo.toml"
+          BUMP_TYPE="${{ inputs.version_bump || 'patch' }}"
+          
+          # Extract current version
+          OLD_VERSION=$(grep -m1 '^version\s*=\s*"' "$CARGO_TOML" | sed -E 's/.*"([^"]+)".*/\1/')
+          if [[ -z "$OLD_VERSION" ]]; then
+            echo "::error::Could not detect version in Cargo.toml"
+            exit 1
+          fi
+          
+          IFS='.' read -r MAJ MIN PAT <<< "$OLD_VERSION"
+          : "${MAJ:=0}" "${MIN:=0}" "${PAT:=0}"
+          
+          case "$BUMP_TYPE" in
+            major) NEW_VERSION="$((MAJ+1)).0.0" ;;
+            minor) NEW_VERSION="$MAJ.$((MIN+1)).0" ;;
+            patch) NEW_VERSION="$MAJ.$MIN.$((PAT+1))" ;;
+            *)     echo "::error::Invalid bump type: $BUMP_TYPE"; exit 1 ;;
+          esac
+          
+          sed -i -E "0,/^version\s*=.*/s//version = \"$NEW_VERSION\"/" "$CARGO_TOML"
+          
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bumped version: $OLD_VERSION -> $NEW_VERSION ($BUMP_TYPE)"
+
+      - name: Update Cargo.lock
+        run: cargo update -w
+
+      - name: Commit and create tag
+        id: commit
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ steps.bump.outputs.version }}"
+          TAG="v$VERSION"
+          
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump to $TAG [skip ci]"
+          git push
+          
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Created tag: $TAG"
+
+  linux:
+    needs: prepare-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cp target/release/libsamplo.so Samplo.clap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: samplo-linux
+          path: Samplo.clap
+
+  windows:
+    needs: prepare-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - shell: bash
+        run: cp target/release/samplo.dll Samplo.clap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: samplo-windows
+          path: Samplo.clap
+
+  android-arm64:
+    needs: prepare-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add aarch64-linux-android
+      - name: Install NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27d
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo install cargo-ndk --locked
+          cargo ndk -t arm64-v8a --platform 26 build --release
+          cp target/aarch64-linux-android/release/libsamplo.so Samplo.clap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: samplo-android-arm64
+          path: Samplo.clap
+
+  release:
+    needs: [prepare-version, linux, windows, android-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mv artifacts/samplo-linux/Samplo.clap Samplo-linux.clap
+          mv artifacts/samplo-windows/Samplo.clap Samplo-windows.clap
+          mv artifacts/samplo-android-arm64/Samplo.clap Samplo-android-arm64.clap
+          
+          # Generate checksums
+          sha256sum Samplo-*.clap > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare-version.outputs.version }}
+          name: v${{ needs.prepare-version.outputs.version }}
+          target_commitish: ${{ needs.prepare-version.outputs.commit_sha }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.mark_prerelease || false }}
+          files: |
+            Samplo-linux.clap
+            Samplo-windows.clap
+            Samplo-android-arm64.clap
+            SHA256SUMS.txt
