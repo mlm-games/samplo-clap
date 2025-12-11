@@ -79,7 +79,7 @@ impl Plugin for Samplo {
             voice.set_sample_rate(self.sample_rate);
         }
 
-        self.scan_and_register_instruments();
+        ensure_instruments_scanned();
 
         if self.instrument.regions.is_empty() {
             self.instrument = loader::create_test_instrument(self.sample_rate);
@@ -325,45 +325,6 @@ impl Samplo {
 
         Ok(())
     }
-
-    /// Scan for instrument definition files and populate the global instrument list.
-    fn scan_and_register_instruments(&mut self) {
-        use crate::loader::scan_instruments;
-
-        let paths_to_try = [
-            PathBuf::from("./instruments"),
-            PathBuf::from("/storage/emulated/0/Samplo/instruments"),
-            dirs::document_dir()
-                .map(|d| d.join("Samplo/instruments"))
-                .unwrap_or_default(),
-        ];
-
-        let mut slots = Vec::new();
-
-        for dir in &paths_to_try {
-            if !dir.exists() {
-                continue;
-            }
-
-            nih_log!("Samplo: searching instruments in {:?}", dir);
-            for path in scan_instruments(dir, 2) {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("<unnamed>")
-                    .to_string();
-                slots.push(InstrumentSlot { name, path });
-            }
-        }
-
-        if !slots.is_empty() {
-            let mut g = instruments().lock().unwrap();
-            *g = slots;
-            nih_log!("Samplo: found {} instruments", g.len());
-        } else {
-            nih_log!("Samplo: no instruments found, using test sine");
-        }
-    }
 }
 
 #[inline]
@@ -405,9 +366,50 @@ fn instruments() -> &'static Mutex<Vec<InstrumentSlot>> {
     GLOBAL_INSTRUMENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn ensure_instruments_scanned() {
+    use crate::loader::scan_instruments;
+
+    let mut list = instruments().lock().unwrap();
+    if !list.is_empty() {
+        return;
+    }
+
+    let paths_to_try = [
+        PathBuf::from("./instruments"),
+        PathBuf::from("/storage/emulated/0/Samplo/instruments"),
+        dirs::document_dir()
+            .map(|d| d.join("Samplo/instruments"))
+            .unwrap_or_default(),
+    ];
+
+    for dir in &paths_to_try {
+        if !dir.exists() {
+            continue;
+        }
+
+        nih_log!("Samplo: searching instruments in {:?}", dir);
+        for path in scan_instruments(dir, 2) {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>")
+                .to_string();
+            list.push(InstrumentSlot { name, path });
+        }
+    }
+
+    if list.is_empty() {
+        nih_log!("Samplo: no instruments found (will use test sine)");
+    } else {
+        nih_log!("Samplo: found {} instruments", list.len());
+    }
+}
+
 /// Helper used by the param's `value_to_string`:
 /// map an index to a human‑readable instrument name.
 pub fn instrument_name_for_index(idx: i32) -> String {
+    ensure_instruments_scanned();
+
     let list = instruments().lock().unwrap();
     if list.is_empty() {
         return "None".to_string();
