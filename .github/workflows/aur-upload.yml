@@ -1,6 +1,8 @@
 name: Publish to AUR
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
 
 jobs:
@@ -9,9 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version from release
-        id: version
-        shell: bash
+      - name: Get version and prepare PKGBUILD
+        id: prep
         run: |
           set -euo pipefail
           
@@ -20,119 +21,38 @@ jobs:
           else
             VERSION=$(curl -sf "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r '.tag_name')
           fi
-          
           VERSION="${VERSION#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Detected version: $VERSION"
-
-      - name: Download CLAP from release
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p downloads
           
-          DOWNLOADED=false
-          for TAG in "$VERSION" "v$VERSION"; do
-            URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Samplo-linux.clap"
-            if curl --output /dev/null --silent --head --fail "$URL"; then
-              wget -O "downloads/Samplo-linux.clap" "$URL"
-              DOWNLOADED=true
-              break
-            fi
-          done
+          wget -O Samplo-linux.clap "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/Samplo-linux.clap"
+          HASH=$(sha256sum Samplo-linux.clap | cut -d' ' -f1)
           
-          if [[ "$DOWNLOADED" != "true" ]]; then
-            echo "Failed to download CLAP binary"
-            exit 1
-          fi
-
-      - name: Calculate SHA256 checksum
-        id: checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          HASH=$(sha256sum "downloads/Samplo-linux.clap" | cut -d ' ' -f 1)
-          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
-
-      - name: Get current AUR package info and determine pkgrel
-        id: pkgrel
-        shell: bash
-        run: |
-          set -euo pipefail
-          
-          NEW_VERSION="${{ steps.version.outputs.version }}"
-          
-          PKGBUILD=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=samplo-clap-bin" 2>/dev/null || echo "")
-          
-          if [[ -n "$PKGBUILD" ]]; then
-            CURRENT_VER=$(echo "$PKGBUILD" | grep "^pkgver=" | head -1 | cut -d= -f2 | tr -d "'" | tr -d '"' | tr -d ' ')
-            CURRENT_PKGREL=$(echo "$PKGBUILD" | grep "^pkgrel=" | head -1 | cut -d= -f2 | tr -d "'" | tr -d '"' | tr -d ' ')
-            echo "Found existing AUR package: version=$CURRENT_VER, pkgrel=$CURRENT_PKGREL"
-          else
-            CURRENT_VER=""
-            CURRENT_PKGREL="0"
-            echo "No existing AUR package found"
-          fi
-          
-          if ! [[ "$CURRENT_PKGREL" =~ ^[0-9]+$ ]]; then
-            CURRENT_PKGREL=0
-          fi
-          
-          if [[ "$NEW_VERSION" == "$CURRENT_VER" ]]; then
-            NEW_PKGREL=$((CURRENT_PKGREL + 1))
-          else
-            NEW_PKGREL=1
-          fi
-          
-          echo "pkgrel=$NEW_PKGREL" >> "$GITHUB_OUTPUT"
-
-      - name: Create PKGBUILD
-        shell: bash
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          PKGREL="${{ steps.pkgrel.outputs.pkgrel }}"
-          HASH="${{ steps.checksums.outputs.hash }}"
-          
-          mkdir -p aur-package
-          cat > aur-package/PKGBUILD << 'EOF'
+          # Generate PKGBUILD (pkgrel is auto-determined by action)
+          cat > PKGBUILD << EOF
           # Maintainer: MLM-stuff <gfxoxinzh@mozmail.com>
           pkgname=samplo-clap-bin
-          _pkgname=samplo
-          pkgver={{VER}}
-          pkgrel={{PKGREL}}
-          pkgdesc="Headless Rust CLAP sfz instrument loader (similar to Sforzando but without an UI and basic sfz support)"
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Headless Rust CLAP sfz instrument loader"
           arch=('x86_64')
           url="https://github.com/mlm-games/samplo-clap"
           license=('MIT')
           depends=('glibc')
-          optdepends=('clap-host: A CLAP host to load the plugin (not required by yadaw)')
-          provides=('samplo-clap')
-          conflicts=('samplo-clap')
-          options=('!strip')
-
-          source=("Samplo-${pkgver}.clap::https://github.com/mlm-games/samplo-clap/releases/download/v${pkgver}/Samplo-linux.clap")
-          sha256sums=('{{HASH}}')
-
+          source=("Samplo-\${pkgver}.clap::https://github.com/mlm-games/samplo-clap/releases/download/v\${pkgver}/Samplo-linux.clap")
+          sha256sums=('${HASH}')
+          
           package() {
-            install -Dm755 "${srcdir}/Samplo-${pkgver}.clap" \
-              "${pkgdir}/usr/lib/clap/Samplo.clap"
+            install -Dm755 "\${srcdir}/Samplo-\${pkgver}.clap" "\${pkgdir}/usr/lib/clap/Samplo.clap"
           }
           EOF
-
-          sed -i "s/{{VER}}/${VERSION}/g" aur-package/PKGBUILD
-          sed -i "s/{{PKGREL}}/${PKGREL}/g" aur-package/PKGBUILD
-          sed -i "s/{{HASH}}/${HASH}/g" aur-package/PKGBUILD
           
-          echo "Generated PKGBUILD:"
-          cat aur-package/PKGBUILD
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@master
+        uses: mlm-games/aur-deploy-action@v1
         with:
-          pkgname: samplo-clap-bin
-          pkgbuild: aur-package/PKGBUILD
+          pkgbuild: ./PKGBUILD
+          auto_pkgrel: true
           commit_username: MLM-stuff
           commit_email: gfxoxinzh@mozmail.com
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "Update to v${{ steps.version.outputs.version }}-${{ steps.pkgrel.outputs.pkgrel }}"
+          commit_message: "Update to v${{ steps.prep.outputs.version }}"
