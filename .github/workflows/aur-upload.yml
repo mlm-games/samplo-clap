@@ -48,7 +48,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Publish to AUR
-        uses: mlm-games/aur-deploy-action@1
+        uses: mlm-games/aur-deploy-action@main
         with:
           pkgbuild: ./PKGBUILD
           auto_pkgrel: true
