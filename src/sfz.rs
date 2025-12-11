@@ -30,7 +30,7 @@ struct OpcodeSet {
     lokey: Option<u8>,
     hikey: Option<u8>,
     pitch_keycenter: Option<u8>,
-    key: Option<u8>, // Sets all three above
+    key: Option<u8>,
 
     // Velocity mapping
     lovel: Option<u8>,
@@ -50,8 +50,12 @@ struct OpcodeSet {
     seq_length: Option<u32>,
     seq_position: Option<u32>,
 
-    // Voice groups (basic)
+    // Voice groups
     group: Option<u32>,
+
+    // CC conditions (for articulation switching)
+    locc: HashMap<u8, u8>,
+    hicc: HashMap<u8, u8>,
 }
 
 impl OpcodeSet {
@@ -81,6 +85,14 @@ impl OpcodeSet {
         merge_field!(seq_length);
         merge_field!(seq_position);
         merge_field!(group);
+
+        // Merge CC conditions
+        for (&cc, &val) in &other.locc {
+            self.locc.insert(cc, val);
+        }
+        for (&cc, &val) in &other.hicc {
+            self.hicc.insert(cc, val);
+        }
     }
 }
 
@@ -141,13 +153,30 @@ impl SfzParser {
         Ok(())
     }
 
+    fn handle_include(&mut self, include_directive: &str) -> Result<(), String> {
+        let include_path = include_directive
+            .trim_start_matches("#include")
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+
+        let full_path = self.base_dir.join(include_path);
+
+        if full_path.exists() {
+            self.parse_file(&full_path)?;
+        } else {
+            nih_plug::nih_log!("Include not found: {}", full_path.display());
+        }
+        Ok(())
+    }
+
     fn parse_line(&mut self, line: &str) -> Result<(), String> {
         let line = strip_comments(line).trim();
         if line.is_empty() {
             return Ok(());
         }
 
-        // Handle #define
+        // Handle #define at start of line
         if line.starts_with("#define") {
             let parts: Vec<&str> = line.splitn(3, ' ').collect();
             if parts.len() >= 3 {
@@ -158,36 +187,30 @@ impl SfzParser {
             return Ok(());
         }
 
-        // Handle #include
+        // Handle #include at start of line
         if line.starts_with("#include") {
-            let include_path = line
-                .trim_start_matches("#include")
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'');
-
-            let full_path = self.base_dir.join(include_path);
-
-            if full_path.exists() {
-                self.parse_file(&full_path)?;
-            } else {
-                nih_plug::nih_log!("Include not found: {}", full_path.display());
-            }
-            return Ok(());
+            return self.handle_include(line);
         }
 
         // Expand defines in the line
         let line = self.expand_defines(line);
         let line = line.trim();
 
+        // Check for #include anywhere in line (after section header or opcodes)
+        let (before_include, include_part) = if let Some(pos) = line.find("#include") {
+            (line[..pos].trim(), Some(&line[pos..]))
+        } else {
+            (line, None)
+        };
+
         // Handle section headers
-        if line.contains('<') {
+        if before_include.contains('<') {
             self.finalize_pending_region();
 
-            if let Some(start) = line.find('<') {
-                if let Some(end) = line.find('>') {
-                    let section_name = line[start + 1..end].to_lowercase();
-                    let rest_of_line = line[end + 1..].trim();
+            if let Some(start) = before_include.find('<') {
+                if let Some(end) = before_include.find('>') {
+                    let section_name = before_include[start + 1..end].to_lowercase();
+                    let rest_of_line = before_include[end + 1..].trim();
 
                     self.current_section = match section_name.as_str() {
                         "control" => Section::Control,
@@ -211,20 +234,33 @@ impl SfzParser {
                             self.pending_region = Some(ops);
                             Section::Region
                         }
-                        "curve" => Section::None, // Skip curve definitions
+                        "curve" => Section::None,
                         _ => Section::None,
                     };
 
                     if !rest_of_line.is_empty() {
                         self.apply_opcodes_to_section(rest_of_line);
                     }
+
+                    // Handle #include after section header
+                    if let Some(inc) = include_part {
+                        self.handle_include(inc)?;
+                    }
                     return Ok(());
                 }
             }
         }
 
-        // Parse opcodes
-        self.apply_opcodes_to_section(&line);
+        // Parse opcodes (before any #include)
+        if !before_include.is_empty() {
+            self.apply_opcodes_to_section(before_include);
+        }
+
+        // Handle #include after opcodes
+        if let Some(inc) = include_part {
+            self.handle_include(inc)?;
+        }
+
         Ok(())
     }
 
@@ -310,7 +346,6 @@ fn parse_opcodes(line: &str) -> HashMap<String, String> {
     while !remaining.is_empty() {
         remaining = remaining.trim_start();
 
-        // Find the next '=' to get opcode name
         let Some(eq_pos) = remaining.find('=') else {
             break;
         };
@@ -318,8 +353,6 @@ fn parse_opcodes(line: &str) -> HashMap<String, String> {
         let key = remaining[..eq_pos].trim().to_lowercase();
         remaining = &remaining[eq_pos + 1..];
 
-        // Value continues until next opcode or end of line
-        // Opcodes are word characters followed by '='
         let value_end = find_next_opcode(remaining).unwrap_or(remaining.len());
         let value = remaining[..value_end].trim().to_string();
 
@@ -346,7 +379,7 @@ fn find_next_opcode(s: &str) -> Option<usize> {
         } else if c.is_whitespace() {
             in_word = false;
         } else if c.is_ascii_alphanumeric() {
-            // Continue
+            // Continue in word
         } else {
             in_word = false;
         }
@@ -356,6 +389,24 @@ fn find_next_opcode(s: &str) -> Option<usize> {
 
 fn apply_opcodes(ops: &mut OpcodeSet, parsed: &HashMap<String, String>) {
     for (key, value) in parsed {
+        // Handle loccN and hiccN opcodes
+        if key.starts_with("locc") {
+            if let Ok(cc_num) = key[4..].parse::<u8>() {
+                if let Ok(val) = value.parse::<u8>() {
+                    ops.locc.insert(cc_num, val);
+                }
+            }
+            continue;
+        }
+        if key.starts_with("hicc") {
+            if let Ok(cc_num) = key[4..].parse::<u8>() {
+                if let Ok(val) = value.parse::<u8>() {
+                    ops.hicc.insert(cc_num, val);
+                }
+            }
+            continue;
+        }
+
         match key.as_str() {
             "sample" => ops.sample = Some(value.clone()),
             "offset" => ops.offset = value.parse().ok(),
@@ -382,18 +433,16 @@ fn apply_opcodes(ops: &mut OpcodeSet, parsed: &HashMap<String, String>) {
             "seq_length" => ops.seq_length = value.parse().ok(),
             "seq_position" => ops.seq_position = value.parse().ok(),
             "group" => ops.group = value.parse().ok(),
-            _ => {}
+            _ => {} // Silently ignore not yet supported opcodes
         }
     }
 }
 
 fn parse_note(s: &str) -> Option<u8> {
-    // Try numeric first
     if let Ok(n) = s.parse::<u8>() {
         return Some(n.min(127));
     }
 
-    // Try note name (c4, c#4, db4, etc.)
     let s = s.to_lowercase();
     let mut chars = s.chars().peekable();
 
@@ -423,7 +472,6 @@ fn parse_note(s: &str) -> Option<u8> {
     let octave_str: String = chars.collect();
     let octave: i8 = octave_str.parse().ok()?;
 
-    // MIDI: C4 = 60
     let midi = (octave + 1) * 12 + note_base + modifier;
 
     if midi >= 0 && midi <= 127 {
