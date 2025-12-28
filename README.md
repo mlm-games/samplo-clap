@@ -233,4 +233,4 @@ cp target/aarch64-linux-android/release/libsamplo.so Samplo.clap
 
 ## License
 
-[MIT](LICENSE)
+[GPLv3](LICENSE)
