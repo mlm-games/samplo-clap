@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Samplo
+Comment=Minimal CLAP sampler with SFZ support
+Icon=io.github.mlm_games.Samplo
+Categories=AudioVideo;Audio;Music;
+NoDisplay=true
+Terminal=false
