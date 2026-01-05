@@ -498,7 +498,7 @@ checksum = "56f7d92ca342cea22a06f2121d944b4fd82af56988c270852495420f961d4ace"
 
 [[package]]
 name = "samplo"
-version = "1.2.6"
+version = "1.2.7"
 dependencies = [
  "dirs",
  "nih_plug",
