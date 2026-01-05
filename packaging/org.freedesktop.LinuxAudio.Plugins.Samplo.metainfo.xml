@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="addon">
+  <id>org.freedesktop.LinuxAudio.Plugins.Samplo</id>
+  <extends>org.freedesktop.LinuxAudio.BaseExtension</extends>
+
+  <name>Samplo</name>
+  <summary>Minimal CLAP sampler plugin with basic SFZ support</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+
+  <developer id="io.github.mlm_games">
+    <name>mlm-games</name>
+  </developer>
+
+  <description>
+    <p>
+      Samplo is a lightweight CLAP audio plugin sampler. It loads SFZ and JSON
+      instrument definitions, providing multi-sample playback with velocity layers,
+      round-robin, and loop support.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>SFZ and JSON instrument format support</li>
+      <li>WAV, FLAC, and OGG Vorbis audio formats</li>
+      <li>Multi-sample mapping with velocity layers</li>
+      <li>Round-robin sample cycling</li>
+      <li>ADSR amplitude envelope</li>
+      <li>Zero-delay feedback SVF filter (LP/HP/BP)</li>
+      <li>Up to 64 voice polyphony</li>
+      <li>Hermite interpolation for pitch shifting</li>
+      <li>Headless operation (no GUI)</li>
+    </ul>
+    <p>
+      Place your instruments in ~/Documents/Samplo/instruments/ and load them
+      via the Instrument parameter in your DAW.
+    </p>
+  </description>
+
+  <url type="homepage">https://github.com/mlm-games/samplo-clap</url>
+  <url type="bugtracker">https://github.com/mlm-games/samplo-clap/issues</url>
+  <url type="vcs-browser">https://github.com/mlm-games/samplo-clap</url>
+
+  <provides>
+    <library>clap/Samplo.clap</library>
+  </provides>
+
+  <keywords>
+    <keyword>sampler</keyword>
+    <keyword>sfz</keyword>
+    <keyword>clap</keyword>
+    <keyword>audio</keyword>
+    <keyword>plugin</keyword>
+    <keyword>instrument</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="1.2.5" date="2025-01-15">
+      <description>
+        <p>Init.</p>
+      </description>
+    </release>
+  </releases>
+</component>
