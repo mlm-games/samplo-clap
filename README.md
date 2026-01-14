@@ -231,6 +231,8 @@ cp target/aarch64-linux-android/release/libsamplo.so Samplo.clap
 | Windows | `%LOCALAPPDATA%\Programs\Common\CLAP\` |
 | Android | App-specific (varies by host) |
 
+Is also available on Arch User Repository (as samplo-bin), and flathub
+
 ## License
 
 [GPLv3](LICENSE)
