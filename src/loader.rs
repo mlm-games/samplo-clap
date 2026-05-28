@@ -4,12 +4,12 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::audio::{Audio, GenericAudioBufferRef};
+use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 /// Loaded audio data
 pub struct AudioData {
@@ -37,10 +37,10 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
 
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
-    let decoder_opts = DecoderOptions::default();
+    let decoder_opts = AudioDecoderOptions::default();
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, format_opts, metadata_opts)
         .map_err(|e| {
             format!(
                 "Cannot identify format of '{}' ({} bytes): {}",
@@ -50,29 +50,36 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
             )
         })?;
 
-    let mut format = probed.format;
-
     let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .find(|t| t.codec_params.as_ref().is_some_and(|p| p.is_audio()))
         .ok_or_else(|| format!("No audio track in '{}'", path.display()))?;
 
     let track_id = track.id;
-    let codec_params = track.codec_params.clone();
 
-    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(1);
-    let sample_rate = codec_params
+    let codec_params = track
+        .codec_params
+        .clone()
+        .ok_or_else(|| format!("No codec parameters in '{}'", path.display()))?;
+
+    let audio_params = codec_params.audio().unwrap();
+    let channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count())
+        .unwrap_or(1);
+    let sample_rate = audio_params
         .sample_rate
         .ok_or_else(|| format!("Unknown sample rate in '{}'", path.display()))?;
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &decoder_opts)
+        .make_audio_decoder(&audio_params, &decoder_opts)
         .map_err(|e| {
             format!(
                 "No decoder for '{}' (codec {:?}): {}",
                 path.file_name().unwrap_or_default().to_string_lossy(),
-                codec_params.codec,
+                audio_params.codec,
                 e
             )
         })?;
@@ -81,20 +88,20 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(symphonia::core::errors::Error::IoError(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
                 break;
             }
             Err(symphonia::core::errors::Error::ResetRequired) => {
-                // Some formats need a reset, try to continue
                 continue;
             }
             Err(_) => break,
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -125,44 +132,44 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
     })
 }
 
-fn append_samples(buffer: &AudioBufferRef, out: &mut Vec<f32>, channels: usize) {
-    match buffer {
-        AudioBufferRef::F32(buf) => {
+fn append_samples(buffer: &GenericAudioBufferRef, out: &mut Vec<f32>, channels: usize) {
+    match *buffer {
+        GenericAudioBufferRef::F32(ref buf) => {
             for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels.count()) {
-                    out.push(buf.chan(ch)[frame]);
+                for ch in 0..channels.min(buf.spec().channels().count()) {
+                    out.push(buf.plane(ch).unwrap()[frame]);
                 }
             }
         }
-        AudioBufferRef::S16(buf) => {
+        GenericAudioBufferRef::S16(ref buf) => {
             const SCALE: f32 = 1.0 / 32768.0;
             for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels.count()) {
-                    out.push(buf.chan(ch)[frame] as f32 * SCALE);
+                for ch in 0..channels.min(buf.spec().channels().count()) {
+                    out.push(buf.plane(ch).unwrap()[frame] as f32 * SCALE);
                 }
             }
         }
-        AudioBufferRef::S24(buf) => {
+        GenericAudioBufferRef::S24(ref buf) => {
             const SCALE: f32 = 1.0 / 8388608.0;
             for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels.count()) {
-                    out.push(buf.chan(ch)[frame].0 as f32 * SCALE);
+                for ch in 0..channels.min(buf.spec().channels().count()) {
+                    out.push(buf.plane(ch).unwrap()[frame].0 as f32 * SCALE);
                 }
             }
         }
-        AudioBufferRef::S32(buf) => {
+        GenericAudioBufferRef::S32(ref buf) => {
             const SCALE: f32 = 1.0 / 2147483648.0;
             for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels.count()) {
-                    out.push(buf.chan(ch)[frame] as f32 * SCALE);
+                for ch in 0..channels.min(buf.spec().channels().count()) {
+                    out.push(buf.plane(ch).unwrap()[frame] as f32 * SCALE);
                 }
             }
         }
-        AudioBufferRef::U8(buf) => {
+        GenericAudioBufferRef::U8(ref buf) => {
             const SCALE: f32 = 1.0 / 128.0;
             for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels.count()) {
-                    out.push((buf.chan(ch)[frame] as f32 - 128.0) * SCALE);
+                for ch in 0..channels.min(buf.spec().channels().count()) {
+                    out.push((buf.plane(ch).unwrap()[frame] as f32 - 128.0) * SCALE);
                 }
             }
         }
