@@ -4,12 +4,24 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::sync::OnceLock;
 use symphonia::core::audio::{Audio, GenericAudioBufferRef};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
+
+fn get_codecs() -> &'static CodecRegistry {
+    static REGISTRY: OnceLock<CodecRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = CodecRegistry::new();
+        symphonia::default::register_enabled_codecs(&mut registry);
+        registry.register_audio_decoder::<symphonia_adapter_mousiki::OpusDecoder>();
+        registry
+    })
+}
 
 /// Loaded audio data
 pub struct AudioData {
@@ -73,7 +85,7 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
         .sample_rate
         .ok_or_else(|| format!("Unknown sample rate in '{}'", path.display()))?;
 
-    let mut decoder = symphonia::default::get_codecs()
+    let mut decoder = get_codecs()
         .make_audio_decoder(&audio_params, &decoder_opts)
         .map_err(|e| {
             format!(

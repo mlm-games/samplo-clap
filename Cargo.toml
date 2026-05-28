@@ -27,6 +27,7 @@ symphonia = { version = "0.6", default-features = false, features = [
     "pcm",
     "adpcm",
 ] }
+symphonia-adapter-mousiki = { git = "https://github.com/mlm-games/symphonia-adapter-mousiki" }
 
 [profile.release]
 lto = "thin"
