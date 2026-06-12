@@ -8,12 +8,20 @@ pub fn fast_tanh(x: f32) -> f32 {
 
 #[inline]
 pub fn flush_denormals(x: f32) -> f32 {
-    if x.abs() < 1e-24 { 0.0 } else { x }
+    if x.is_subnormal() { 0.0 } else { x }
 }
 
 #[inline]
 pub fn db_to_linear(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
+}
+
+/// Convert pan value (-1..1) to left/right gain
+#[inline]
+pub fn pan_to_gains(pan: f32) -> (f32, f32) {
+    let x = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
+    let theta = x * core::f32::consts::FRAC_PI_2;
+    (theta.cos(), theta.sin())
 }
 
 /// Linear interpolation between two samples
@@ -144,7 +152,7 @@ impl Adsr {
 
     pub fn note_on(&mut self) {
         self.state = AdsrState::Attack;
-        // Don't reset level - allows legato-style re-triggering
+        // Keep level for legato, but compute inc to take full attack time
     }
 
     pub fn note_off(&mut self) {
@@ -168,7 +176,7 @@ impl Adsr {
                 let inc = if self.a_samples <= 1.0 {
                     1.0
                 } else {
-                    1.0 / self.a_samples
+                    (1.0 - self.level) / self.a_samples
                 };
                 self.level += inc;
                 if self.level >= 1.0 {

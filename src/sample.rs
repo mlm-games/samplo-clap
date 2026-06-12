@@ -1,5 +1,14 @@
+use crate::dsp;
 use serde::Deserialize;
+use smallvec::SmallVec;
 use std::sync::Arc;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LoopMode {
+    NoLoop,
+    Continuous,
+    Sustain,
+}
 
 /// A single audio sample region
 pub struct Region {
@@ -27,7 +36,7 @@ pub struct Region {
     // Loop points (in frames)
     pub loop_start: Option<usize>,
     pub loop_end: Option<usize>,
-    pub loop_enabled: bool,
+    pub loop_mode: LoopMode,
 
     // Round robin
     /// Group ID for round robin (regions with same group rotate)
@@ -38,9 +47,11 @@ pub struct Region {
     // Per-region adjustments
     pub tune_cents: f32,
     pub volume_db: f32,
+    pub volume_lin: f32,
     pub pan: f32,
 
-    /// Original sample path (for debugging)
+    /// Original sample path (debug only)
+    #[cfg(debug_assertions)]
     pub sample_path: String,
 }
 
@@ -81,7 +92,7 @@ impl Region {
 
         if self.channels == 1 {
             let m = self.interpolate_mono(idx, frac);
-            let (gl, gr) = pan_to_gains(self.pan);
+            let (gl, gr) = dsp::pan_to_gains(self.pan);
             (m * gl, m * gr)
         } else {
             let l = self.interpolate_channel(idx, frac, 0);
@@ -135,8 +146,8 @@ impl Region {
 /// Round robin state tracker
 #[derive(Default)]
 pub struct RoundRobinState {
-    /// Maps (note, rr_group) -> next sequence number
-    state: std::collections::HashMap<(u8, u32), u32>,
+    /// Per-group per-note sequence counters: group -> [note_0..note_127]
+    state: std::collections::HashMap<u32, Box<[u32; 128]>>,
 }
 
 impl RoundRobinState {
@@ -148,8 +159,8 @@ impl RoundRobinState {
 
     /// Get and advance the round robin counter for a note/group
     pub fn next(&mut self, note: u8, group: u32, max_seq: u32) -> u32 {
-        let key = (note, group);
-        let current = self.state.entry(key).or_insert(0);
+        let arr = self.state.entry(group).or_insert_with(|| Box::new([0u32; 128]));
+        let current = &mut arr[note as usize];
         let seq = *current;
         *current = (seq + 1) % (max_seq + 1);
         seq
@@ -165,8 +176,8 @@ impl RoundRobinState {
 pub struct Instrument {
     pub name: String,
     pub regions: Vec<Region>,
-    /// Maps (note, velocity_layer, rr_group) -> max rr_seq for that combo
-    rr_max: std::collections::HashMap<(u8, u8, u32), u32>,
+    /// Per-group rr_max: group -> [note*4 + vel_layer] -> max_seq
+    rr_max: std::collections::HashMap<u32, Box<[u32; 512]>>,
 }
 
 impl Instrument {
@@ -193,14 +204,15 @@ impl Instrument {
         self.rr_max.clear();
 
         for region in &self.regions {
-            // For each note this region covers
             for note in region.lo_note..=region.hi_note {
-                // Simplified: use velocity midpoint as layer key
                 let vel_layer = (region.lo_vel / 32).min(3);
-                let key = (note, vel_layer, region.rr_group);
+                let idx = (note as usize) * 4 + vel_layer as usize;
 
-                let entry = self.rr_max.entry(key).or_insert(0);
-                *entry = (*entry).max(region.rr_seq);
+                let arr = self
+                    .rr_max
+                    .entry(region.rr_group)
+                    .or_insert_with(|| Box::new([0u32; 512]));
+                arr[idx] = arr[idx].max(region.rr_seq);
             }
         }
     }
@@ -208,10 +220,8 @@ impl Instrument {
     /// Get max round robin sequence for a note/group
     pub fn get_rr_max(&self, note: u8, velocity: u8, group: u32) -> u32 {
         let vel_layer = (velocity / 32).min(3);
-        self.rr_max
-            .get(&(note, vel_layer, group))
-            .copied()
-            .unwrap_or(0)
+        let idx = (note as usize) * 4 + vel_layer as usize;
+        self.rr_max.get(&group).map(|arr| arr[idx]).unwrap_or(0)
     }
 
     /// Find the best matching region for a note/velocity, with round robin
@@ -222,7 +232,7 @@ impl Instrument {
         rr_state: &mut RoundRobinState,
     ) -> Option<usize> {
         // First pass: find all matching regions and determine groups
-        let mut matches: Vec<(usize, u32, u32)> = Vec::new(); // (index, group, seq)
+        let mut matches: SmallVec<[(usize, u32, u32); 8]> = SmallVec::new(); // (index, group, seq)
 
         for (i, region) in self.regions.iter().enumerate() {
             if region.matches_base(note, velocity) {
@@ -307,9 +317,4 @@ fn default_root() -> u8 {
     60
 }
 
-#[inline]
-fn pan_to_gains(pan: f32) -> (f32, f32) {
-    let x = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
-    let theta = x * core::f32::consts::FRAC_PI_2;
-    (theta.cos(), theta.sin())
-}
+

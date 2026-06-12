@@ -536,6 +536,7 @@ dependencies = [
  "nih_plug",
  "serde",
  "serde_json",
+ "smallvec",
  "symphonia",
  "symphonia-adapter-mousiki",
 ]

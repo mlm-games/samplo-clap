@@ -2,7 +2,7 @@
 name = "samplo"
 version = "1.2.8"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
 authors = ["mlm-games"]
 description = "Samplo: minimal Rust CLAP sampler"
 repository = "https://github.com/mlm-games/samplo-clap"
@@ -28,6 +28,7 @@ symphonia = { version = "0.6", default-features = false, features = [
     "adpcm",
 ] }
 symphonia-adapter-mousiki = { git = "https://github.com/mlm-games/symphonia-adapter-mousiki" }
+smallvec = "1.14"
 
 [profile.release]
 lto = "thin"

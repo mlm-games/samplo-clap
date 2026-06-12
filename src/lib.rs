@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use voice::Voice;
 
-const MAX_VOICES: usize = 64;
+pub(crate) const MAX_VOICES: usize = 64;
+pub(crate) const MAX_INSTRUMENTS: i32 = 1024;
 
 pub struct Samplo {
     params: Arc<SamploParams>,
@@ -24,6 +25,7 @@ pub struct Samplo {
     frame_counter: u64,
 
     current_instrument_idx: usize,
+    pending_instrument: Arc<Mutex<Option<Instrument>>>,
 }
 
 impl Default for Samplo {
@@ -37,6 +39,7 @@ impl Default for Samplo {
             rr_state: RoundRobinState::new(),
             frame_counter: 0,
             current_instrument_idx: 0,
+            pending_instrument: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -45,8 +48,8 @@ impl Plugin for Samplo {
     const NAME: &'static str = "Samplo";
     const VENDOR: &'static str = "mlm-games";
     const URL: &'static str = "https://github.com/mlm-games/samplo-clap";
-    const EMAIL: &'static str = "me@example.com";
-    const VERSION: &'static str = "1.1.0";
+    const EMAIL: &'static str = "";
+    const VERSION: &'static str = "1.2.8";
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: None,
@@ -105,6 +108,13 @@ impl Plugin for Samplo {
     ) -> ProcessStatus {
         self.frame_counter = self.frame_counter.wrapping_add(1);
 
+        // Pick up instrument loaded in background
+        if let Some(new_inst) = self.pending_instrument.lock().unwrap().take() {
+            self.instrument = new_inst;
+            self.rr_state.reset();
+            nih_log!("Samplo: loaded instrument");
+        }
+
         let params = self.params.clone();
 
         let inst_idx = params.instrument_index.value().max(0) as usize;
@@ -113,15 +123,9 @@ impl Plugin for Samplo {
 
             let list = instruments().lock().unwrap();
             if let Some(slot) = list.get(self.current_instrument_idx) {
-                match self.load_instrument_from_path(&slot.path) {
-                    Ok(()) => {
-                        self.rr_state.reset();
-                        nih_log!("Samplo: loaded instrument '{}'", slot.name);
-                    }
-                    Err(e) => {
-                        nih_log!("Samplo: failed to load instrument {:?}: {}", slot.path, e);
-                    }
-                }
+                let path = slot.path.clone();
+                drop(list);
+                ctx.execute_background(BackgroundTask::LoadInstrument(path));
             }
         }
 
@@ -180,10 +184,10 @@ impl Plugin for Samplo {
                     continue;
                 }
 
-                voice.env.set_ms(attack, decay, sustain, release);
+                voice.set_env_ms(attack, decay, sustain, release);
 
                 let (l, r) =
-                    voice.render(&self.instrument, cutoff, res, filter_mode, self.sample_rate);
+                    voice.render(&self.instrument, cutoff, res, filter_mode);
 
                 out_l += l;
                 out_r += r;
@@ -198,7 +202,7 @@ impl Plugin for Samplo {
                 }
             }
 
-            let (pan_l, pan_r) = pan_to_gains(pan);
+            let (pan_l, pan_r) = crate::dsp::pan_to_gains(pan);
             out_l *= gain * pan_l;
             out_r *= gain * pan_r;
 
@@ -218,9 +222,28 @@ impl Plugin for Samplo {
     }
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
-        Box::new(|task| match task {
+        let pending = self.pending_instrument.clone();
+        Box::new(move |task| match task {
             BackgroundTask::LoadInstrument(path) => {
                 nih_log!("Loading instrument: {:?}", path);
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let result = match ext {
+                    "json" => crate::loader::load_instrument_json(&path),
+                    "sfz" => crate::sfz::load_sfz(&path),
+                    _ => {
+                        nih_log!("Unknown format: {}", ext);
+                        return;
+                    }
+                };
+                match result {
+                    Ok(inst) => {
+                        *pending.lock().unwrap() = Some(inst);
+                        nih_log!("Loaded instrument: {}", path.display());
+                    }
+                    Err(e) => {
+                        nih_log!("Failed to load {:?}: {}", path, e);
+                    }
+                }
             }
         })
     }
@@ -266,7 +289,7 @@ impl Samplo {
         tune_cents: f32,
         vel_sens: f32,
     ) {
-        let midi_vel = (velocity * 127.0) as u8;
+        let midi_vel = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
 
         // Find matching region with round robin
         let region_idx = match self
@@ -309,29 +332,6 @@ impl Samplo {
         }
     }
 
-    /// Load an instrument from a path (JSON or SFZ)
-    pub fn load_instrument_from_path(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        let instrument = match ext {
-            "json" => loader::load_instrument_json(path)?,
-            "sfz" => sfz::load_sfz(path)?,
-            _ => return Err(format!("Unknown format: {}", ext)),
-        };
-
-        self.instrument = instrument;
-        self.rr_state.reset();
-        nih_log!("Loaded instrument: {}", self.instrument.name);
-
-        Ok(())
-    }
-}
-
-#[inline]
-fn pan_to_gains(pan: f32) -> (f32, f32) {
-    let x = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
-    let theta = x * core::f32::consts::FRAC_PI_2;
-    (theta.cos(), theta.sin())
 }
 
 impl ClapPlugin for Samplo {

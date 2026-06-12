@@ -1,5 +1,5 @@
-use crate::dsp::{Adsr, FilterMode, ZdfSvf, db_to_linear, flush_denormals};
-use crate::sample::Instrument;
+use crate::dsp::{Adsr, FilterMode, ZdfSvf, flush_denormals};
+use crate::sample::{Instrument, LoopMode};
 
 pub struct Voice {
     pub active: bool,
@@ -8,17 +8,25 @@ pub struct Voice {
     pub note_id: Option<i32>,
     pub velocity: f32,
 
-    // Sample playback
     pub region_idx: usize,
     pub position: f64,
     pub playback_rate: f64,
 
-    // Envelope and filter
     pub env: Adsr,
-    pub filter: ZdfSvf,
+    pub filter_l: ZdfSvf,
+    pub filter_r: ZdfSvf,
 
     pub releasing: bool,
     pub age: u64,
+
+    last_cutoff: f32,
+    last_q: f32,
+    last_filter_mode: FilterMode,
+
+    last_a_ms: f32,
+    last_d_ms: f32,
+    last_s: f32,
+    last_r_ms: f32,
 }
 
 impl Voice {
@@ -35,16 +43,27 @@ impl Voice {
             playback_rate: 1.0,
 
             env: Adsr::new(sr),
-            filter: ZdfSvf::new(sr),
+            filter_l: ZdfSvf::new(sr),
+            filter_r: ZdfSvf::new(sr),
 
             releasing: false,
             age: 0,
+
+            last_cutoff: -1.0,
+            last_q: -1.0,
+            last_filter_mode: FilterMode::Off,
+
+            last_a_ms: -1.0,
+            last_d_ms: -1.0,
+            last_s: -1.0,
+            last_r_ms: -1.0,
         }
     }
 
     pub fn set_sample_rate(&mut self, sr: f32) {
         self.env.set_sample_rate(sr);
-        self.filter.set_sample_rate(sr);
+        self.filter_l.set_sample_rate(sr);
+        self.filter_r.set_sample_rate(sr);
     }
 
     pub fn start(
@@ -71,7 +90,8 @@ impl Voice {
 
         self.env.reset();
         self.env.note_on();
-        self.filter.reset();
+        self.filter_l.reset();
+        self.filter_r.reset();
     }
 
     pub fn release(&mut self) {
@@ -87,27 +107,23 @@ impl Voice {
         self.env.reset();
     }
 
-    /// Render one stereo sample frame
     pub fn render(
         &mut self,
         instrument: &Instrument,
         filter_cutoff: f32,
         filter_q: f32,
         filter_mode: FilterMode,
-        sample_rate: f32,
     ) -> (f32, f32) {
         if !self.active {
             return (0.0, 0.0);
         }
 
-        // Get envelope
         let env = self.env.next();
         if self.env.is_idle() {
             self.active = false;
             return (0.0, 0.0);
         }
 
-        // Get region
         let region = match instrument.regions.get(self.region_idx) {
             Some(r) => r,
             None => {
@@ -116,57 +132,89 @@ impl Voice {
             }
         };
 
-        // Check if we've reached the end
         let end_frame = region.num_frames;
         if self.position >= end_frame as f64 {
-            if region.loop_enabled {
-                if let (Some(start), Some(end)) = (region.loop_start, region.loop_end) {
-                    let loop_len = (end - start) as f64;
-                    if loop_len > 0.0 {
-                        self.position = start as f64 + ((self.position - start as f64) % loop_len);
+            match region.loop_mode {
+                LoopMode::Continuous => {
+                    if let (Some(start), Some(end)) = (region.loop_start, region.loop_end) {
+                        let loop_len = (end - start) as f64;
+                        if loop_len > 0.0 {
+                            self.position =
+                                start as f64 + ((self.position - start as f64) % loop_len);
+                        }
                     }
                 }
-            } else {
-                // One-shot ended
-                self.active = false;
-                return (0.0, 0.0);
+                LoopMode::Sustain if !self.releasing => {
+                    if let (Some(start), Some(end)) = (region.loop_start, region.loop_end) {
+                        let loop_len = (end - start) as f64;
+                        if loop_len > 0.0 {
+                            self.position =
+                                start as f64 + ((self.position - start as f64) % loop_len);
+                        }
+                    }
+                }
+                _ => {
+                    self.active = false;
+                    return (0.0, 0.0);
+                }
             }
         }
 
-        // Handle loop during sustain
-        if region.loop_enabled && !self.releasing {
+        // Sustain loop: wrap during sustain, play through end on release
+        if region.loop_mode == LoopMode::Sustain && !self.releasing {
             if let (Some(start), Some(end)) = (region.loop_start, region.loop_end) {
                 if self.position >= end as f64 {
                     let loop_len = (end - start) as f64;
                     if loop_len > 0.0 {
-                        self.position = start as f64 + ((self.position - end as f64) % loop_len);
+                        self.position =
+                            start as f64 + ((self.position - end as f64) % loop_len);
                     }
                 }
             }
         }
 
-        // Get sample
         let (mut l, mut r) = region.get_sample_stereo(self.position);
 
-        // Apply region volume
-        let region_gain = db_to_linear(region.volume_db);
+        let region_gain = region.volume_lin;
         l *= region_gain;
         r *= region_gain;
 
-        // Apply envelope and velocity
         let amp = env * self.velocity;
         l *= amp;
         r *= amp;
 
-        // Apply filter
-        self.filter.set(filter_cutoff, filter_q, filter_mode);
-        l = self.filter.process(l);
-        // For stereo, we'd ideally have two filters, but for simplicity:
-        r = self.filter.process(r);
+        // Cache filter params: only recompute when they change
+        if filter_cutoff != self.last_cutoff
+            || filter_q != self.last_q
+            || filter_mode != self.last_filter_mode
+        {
+            self.filter_l.set(filter_cutoff, filter_q, filter_mode);
+            self.filter_r.set(filter_cutoff, filter_q, filter_mode);
+            self.last_cutoff = filter_cutoff;
+            self.last_q = filter_q;
+            self.last_filter_mode = filter_mode;
+        }
+        l = self.filter_l.process(l);
+        r = self.filter_r.process(r);
 
-        // Advance position
         self.position += self.playback_rate;
 
         (flush_denormals(l), flush_denormals(r))
+    }
+
+    /// Call from process() to update ADSR only on change
+    pub fn set_env_ms(&mut self, a_ms: f32, d_ms: f32, s: f32, r_ms: f32) {
+        if a_ms == self.last_a_ms
+            && d_ms == self.last_d_ms
+            && s == self.last_s
+            && r_ms == self.last_r_ms
+        {
+            return;
+        }
+        self.env.set_ms(a_ms, d_ms, s, r_ms);
+        self.last_a_ms = a_ms;
+        self.last_d_ms = d_ms;
+        self.last_s = s;
+        self.last_r_ms = r_ms;
     }
 }

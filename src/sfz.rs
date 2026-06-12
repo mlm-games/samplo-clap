@@ -143,14 +143,17 @@ impl SfzParser {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
-        self.include_depth += 1;
+        self.include_depth = self.include_depth.saturating_add(1);
 
-        for line in content.lines() {
-            self.parse_line(line)?;
-        }
+        let result = (|| {
+            for line in content.lines() {
+                self.parse_line(line)?;
+            }
+            Ok(())
+        })();
 
-        self.include_depth -= 1;
-        Ok(())
+        self.include_depth = self.include_depth.saturating_sub(1);
+        result
     }
 
     fn handle_include(&mut self, include_directive: &str) -> Result<(), String> {
@@ -462,7 +465,7 @@ fn parse_note(s: &str) -> Option<u8> {
             chars.next();
             1i8
         }
-        Some('b') | Some('f') => {
+        Some('b') => {
             chars.next();
             -1i8
         }
@@ -474,8 +477,8 @@ fn parse_note(s: &str) -> Option<u8> {
 
     let midi = (octave + 1) * 12 + note_base + modifier;
 
-    if midi >= 0 && midi <= 127 {
-        Some(midi as u8)
+    if midi >= 0 {
+        Some(midi.min(127) as u8)
     } else {
         None
     }
@@ -498,12 +501,15 @@ fn build_region(ops: &OpcodeSet, base_dir: &Path, default_path: &str) -> Option<
 
     let audio = load_audio(&sample_path).ok()?;
 
-    let loop_enabled = ops
-        .loop_mode
-        .as_ref()
-        .map(|m| m == "loop_continuous" || m == "loop_sustain")
-        .unwrap_or(false);
+    use crate::sample::LoopMode;
 
+    let loop_mode = match ops.loop_mode.as_deref() {
+        Some("loop_continuous") => LoopMode::Continuous,
+        Some("loop_sustain") => LoopMode::Sustain,
+        _ => LoopMode::NoLoop,
+    };
+
+    let vol_db = ops.volume.unwrap_or(0.0);
     Some(Region {
         data: Arc::new(audio.samples),
         channels: audio.channels,
@@ -516,12 +522,14 @@ fn build_region(ops: &OpcodeSet, base_dir: &Path, default_path: &str) -> Option<
         hi_vel: ops.hivel.unwrap_or(127),
         loop_start: ops.loop_start,
         loop_end: ops.loop_end,
-        loop_enabled,
+        loop_mode,
         rr_group: ops.group.unwrap_or(0),
         rr_seq: ops.seq_position.unwrap_or(1).saturating_sub(1),
         tune_cents: ops.tune.unwrap_or(0.0),
-        volume_db: ops.volume.unwrap_or(0.0),
+        volume_db: vol_db,
+        volume_lin: crate::dsp::db_to_linear(vol_db),
         pan: ops.pan.map(|p| p / 100.0).unwrap_or(0.0),
+        #[cfg(debug_assertions)]
         sample_path: sample_path.to_string_lossy().to_string(),
     })
 }

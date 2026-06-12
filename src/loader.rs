@@ -119,8 +119,10 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
 
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
-            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-            Err(_) => continue,
+            Err(e) => {
+                nih_plug::nih_log!("Decode error in '{}': {:?}", path.display(), e);
+                continue;
+            }
         };
 
         append_samples(&decoded, &mut samples, channels);
@@ -147,41 +149,60 @@ pub fn load_audio(path: &Path) -> Result<AudioData, String> {
 fn append_samples(buffer: &GenericAudioBufferRef, out: &mut Vec<f32>, channels: usize) {
     match *buffer {
         GenericAudioBufferRef::F32(ref buf) => {
-            for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels().count()) {
-                    out.push(buf.plane(ch).unwrap()[frame]);
+            let n_ch = channels.min(buf.spec().channels().count());
+            let frames = buf.frames();
+            out.reserve(frames * n_ch);
+            let planes: Vec<&[f32]> = (0..n_ch).map(|ch| buf.plane(ch).unwrap()).collect();
+            for frame in 0..frames {
+                for ch in 0..n_ch {
+                    out.push(planes[ch][frame]);
                 }
             }
         }
         GenericAudioBufferRef::S16(ref buf) => {
             const SCALE: f32 = 1.0 / 32768.0;
-            for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels().count()) {
-                    out.push(buf.plane(ch).unwrap()[frame] as f32 * SCALE);
+            let n_ch = channels.min(buf.spec().channels().count());
+            let frames = buf.frames();
+            out.reserve(frames * n_ch);
+            let planes: Vec<&[i16]> = (0..n_ch).map(|ch| buf.plane(ch).unwrap()).collect();
+            for frame in 0..frames {
+                for ch in 0..n_ch {
+                    out.push(planes[ch][frame] as f32 * SCALE);
                 }
             }
         }
         GenericAudioBufferRef::S24(ref buf) => {
             const SCALE: f32 = 1.0 / 8388608.0;
-            for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels().count()) {
+            let n_ch = channels.min(buf.spec().channels().count());
+            let frames = buf.frames();
+            out.reserve(frames * n_ch);
+            for frame in 0..frames {
+                for ch in 0..n_ch {
                     out.push(buf.plane(ch).unwrap()[frame].0 as f32 * SCALE);
                 }
             }
         }
         GenericAudioBufferRef::S32(ref buf) => {
             const SCALE: f32 = 1.0 / 2147483648.0;
-            for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels().count()) {
-                    out.push(buf.plane(ch).unwrap()[frame] as f32 * SCALE);
+            let n_ch = channels.min(buf.spec().channels().count());
+            let frames = buf.frames();
+            out.reserve(frames * n_ch);
+            let planes: Vec<&[i32]> = (0..n_ch).map(|ch| buf.plane(ch).unwrap()).collect();
+            for frame in 0..frames {
+                for ch in 0..n_ch {
+                    out.push(planes[ch][frame] as f32 * SCALE);
                 }
             }
         }
         GenericAudioBufferRef::U8(ref buf) => {
             const SCALE: f32 = 1.0 / 128.0;
-            for frame in 0..buf.frames() {
-                for ch in 0..channels.min(buf.spec().channels().count()) {
-                    out.push((buf.plane(ch).unwrap()[frame] as f32 - 128.0) * SCALE);
+            let n_ch = channels.min(buf.spec().channels().count());
+            let frames = buf.frames();
+            out.reserve(frames * n_ch);
+            let planes: Vec<&[u8]> = (0..n_ch).map(|ch| buf.plane(ch).unwrap()).collect();
+            for frame in 0..frames {
+                for ch in 0..n_ch {
+                    out.push((planes[ch][frame] as f32 - 128.0) * SCALE);
                 }
             }
         }
@@ -216,6 +237,8 @@ pub fn load_instrument_json(def_path: &Path) -> Result<Instrument, String> {
 fn load_region(sample_path: &Path, def: &RegionDef) -> Result<Region, String> {
     let audio = load_audio(sample_path)?;
 
+    use crate::sample::LoopMode;
+
     Ok(Region {
         data: Arc::new(audio.samples),
         channels: audio.channels,
@@ -230,15 +253,21 @@ fn load_region(sample_path: &Path, def: &RegionDef) -> Result<Region, String> {
 
         loop_start: def.loop_start,
         loop_end: def.loop_end,
-        loop_enabled: def.loop_enabled,
+        loop_mode: if def.loop_enabled {
+            LoopMode::Continuous
+        } else {
+            LoopMode::NoLoop
+        },
 
         rr_group: def.rr_group,
         rr_seq: def.rr_seq,
 
         tune_cents: def.tune_cents,
         volume_db: def.volume_db,
+        volume_lin: crate::dsp::db_to_linear(def.volume_db),
         pan: def.pan,
 
+        #[cfg(debug_assertions)]
         sample_path: sample_path.to_string_lossy().to_string(),
     })
 }
@@ -260,6 +289,10 @@ fn scan_recursive(dir: &Path, current_depth: usize, max_depth: usize, found: &mu
     for entry in entries.flatten() {
         let path = entry.path();
 
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
         // Skips hidden directories
         if path
             .file_name()
@@ -270,9 +303,9 @@ fn scan_recursive(dir: &Path, current_depth: usize, max_depth: usize, found: &mu
             continue;
         }
 
-        if path.is_file() && is_instrument_file(&path) {
+        if ft.is_file() && is_instrument_file(&path) {
             found.push(path);
-        } else if path.is_dir() && current_depth < max_depth {
+        } else if ft.is_dir() && current_depth < max_depth {
             // Skip common non-instrument directories
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !matches!(name.to_lowercase().as_str(), "samples" | "waves" | "audio") {
@@ -308,6 +341,8 @@ pub fn create_test_instrument(sample_rate: f32) -> Instrument {
         data.push(sample);
     }
 
+    use crate::sample::LoopMode;
+
     let region = Region {
         data: Arc::new(data),
         channels: 1,
@@ -322,15 +357,17 @@ pub fn create_test_instrument(sample_rate: f32) -> Instrument {
 
         loop_start: Some((sample_rate * 0.1) as usize),
         loop_end: Some((sample_rate * 0.9) as usize),
-        loop_enabled: true,
+        loop_mode: LoopMode::Continuous,
 
         rr_group: 0,
         rr_seq: 0,
 
         tune_cents: 0.0,
         volume_db: 0.0,
+        volume_lin: crate::dsp::db_to_linear(0.0),
         pan: 0.0,
 
+        #[cfg(debug_assertions)]
         sample_path: String::from("<generated>"),
     };
 

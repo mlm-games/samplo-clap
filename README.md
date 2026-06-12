@@ -48,7 +48,7 @@ Samplo scans up to 2 levels deep, making it compatible with instrument collectio
 
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
-| **Instrument** | 0-2047 | 0 | Select instrument (sorted alphabetically) |
+| **Instrument** | 0-1023 | 0 | Select instrument (sorted alphabetically) |
 | **Attack** | 0-2000 ms | 5 ms | Amplitude envelope attack time |
 | **Decay** | 1-4000 ms | 100 ms | Amplitude envelope decay time |
 | **Sustain** | 0-1 | 1.0 | Amplitude envelope sustain level |
