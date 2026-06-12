@@ -132,8 +132,15 @@ impl Default for SamploParams {
 
             instrument_index: {
                 use std::sync::Arc;
-                IntParam::new("Instrument", 0, IntRange::Linear { min: 0, max: crate::MAX_INSTRUMENTS - 1 })
-                    .with_value_to_string(Arc::new(|idx| crate::instrument_name_for_index(idx)))
+                IntParam::new(
+                    "Instrument",
+                    0,
+                    IntRange::Linear {
+                        min: 0,
+                        max: crate::MAX_INSTRUMENTS - 1,
+                    },
+                )
+                .with_value_to_string(Arc::new(|idx| crate::instrument_name_for_index(idx)))
             },
         }
     }

@@ -166,8 +166,7 @@ impl Voice {
                 if self.position >= end as f64 {
                     let loop_len = (end - start) as f64;
                     if loop_len > 0.0 {
-                        self.position =
-                            start as f64 + ((self.position - end as f64) % loop_len);
+                        self.position = start as f64 + ((self.position - end as f64) % loop_len);
                     }
                 }
             }

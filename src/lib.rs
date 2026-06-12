@@ -186,8 +186,7 @@ impl Plugin for Samplo {
 
                 voice.set_env_ms(attack, decay, sustain, release);
 
-                let (l, r) =
-                    voice.render(&self.instrument, cutoff, res, filter_mode);
+                let (l, r) = voice.render(&self.instrument, cutoff, res, filter_mode);
 
                 out_l += l;
                 out_r += r;
@@ -331,7 +330,6 @@ impl Samplo {
             }
         }
     }
-
 }
 
 impl ClapPlugin for Samplo {

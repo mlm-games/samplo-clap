@@ -159,7 +159,10 @@ impl RoundRobinState {
 
     /// Get and advance the round robin counter for a note/group
     pub fn next(&mut self, note: u8, group: u32, max_seq: u32) -> u32 {
-        let arr = self.state.entry(group).or_insert_with(|| Box::new([0u32; 128]));
+        let arr = self
+            .state
+            .entry(group)
+            .or_insert_with(|| Box::new([0u32; 128]));
         let current = &mut arr[note as usize];
         let seq = *current;
         *current = (seq + 1) % (max_seq + 1);
@@ -316,5 +319,3 @@ pub struct RegionDef {
 fn default_root() -> u8 {
     60
 }
-
-
